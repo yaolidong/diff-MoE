@@ -1,20 +1,25 @@
 import torch
 import torch.nn as nn
-from moe_encoders import ImageMoE, TextMoE, CrossAttention
 
 class DualTowerModel(nn.Module):
-    def __init__(self, num_classes, image_input_dim=784, output_dim=128):
-        super().__init__()
-        self.image_encoder = ImageMoE(input_dim=image_input_dim, output_dim=output_dim)
-        self.text_encoder = nn.Embedding(num_classes, output_dim)
-        self.cross_attention = CrossAttention(output_dim)
-    
-    def forward(self, image, text):
-        img_first_vec, img_second_vec, img_cls_first, img_cls_second = self.image_encoder(image)
-        txt_first_vec, txt_second_vec, txt_cls_first, txt_cls_second = self.text_encoder(text)
-        
-        # 确保所有输出都经过归一化
-        img_cls_second = nn.functional.normalize(img_cls_second, dim=1)
-        txt_cls_second = nn.functional.normalize(txt_cls_second, dim=1)
-        
-        return img_first_vec, img_second_vec, img_cls_first, img_cls_second, txt_first_vec, txt_second_vec, txt_cls_first, txt_cls_second
+    def __init__(self, num_classes, vocab_size=30522, embed_dim=768):
+        super(DualTowerModel, self).__init__()
+        self.image_tower = nn.Sequential(
+            nn.Linear(784, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+        self.text_tower = nn.Sequential(
+            nn.Embedding(vocab_size, embed_dim),
+            nn.Linear(embed_dim, 256),
+            nn.ReLU()
+        )
+        self.classifier = nn.Linear(256 + 256, num_classes)
+
+    def forward(self, images, input_ids, attention_mask):
+        image_features = self.image_tower(images)
+        text_features = self.text_tower(input_ids).mean(dim=1)
+        combined_features = torch.cat((image_features, text_features), dim=1)
+        output = self.classifier(combined_features)
+        return output

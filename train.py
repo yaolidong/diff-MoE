@@ -14,38 +14,29 @@ def train(model, dataloader, optimizer, device, num_epochs, save_path):
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-
-        for batch_idx, (images, texts, labels) in enumerate(dataloader):
+        for batch_idx, (images, input_ids, attention_mask, labels) in enumerate(dataloader):
             images = images.to(device)
-            texts = texts.to(device)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-
-            img_first_vec, img_second_vec, img_cls_first, img_cls_second, txt_first_vec, txt_second_vec, txt_cls_first, txt_cls_second = model(images, texts)
-
-            # 计算损失
-            loss_cls1 = contrastive_loss(img_cls_first, txt_cls_first)
-            loss_cls2 = contrastive_loss(img_cls_second, txt_cls_second)
-            loss_img = contrastive_loss(img_first_vec, img_second_vec)
-            loss_txt = contrastive_loss(txt_first_vec, txt_second_vec)
-            
-            loss = loss_cls1 + loss_cls2 + loss_img + loss_txt
+            outputs = model(images, input_ids, attention_mask)
+            loss = F.cross_entropy(outputs, labels)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
 
             if batch_idx % 100 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
 
         avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch}, Average loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
 
-        # 保存最佳模型
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(), save_path)
             print(f"Model saved to {save_path}")
 
-    return model
+    print("Training completed.")

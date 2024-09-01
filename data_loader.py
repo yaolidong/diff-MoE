@@ -25,19 +25,16 @@ def collate_fn(batch):
     texts = [label_to_text[label] for label in labels]
     labels = torch.tensor(labels)
 
-    # 将文本直接转换为张量
-    text_tensors = torch.tensor([text for text in texts])
-    print(f"每个text_tensor的维度: {text_tensors.shape}")
+    tokenizer = BertTokenizer.from_pretrained("./bert-base-uncased")
+    text_tensors = tokenizer(texts, padding='max_length', truncation=True, max_length=128, return_tensors="pt")
     
-    max_length = 128
-    if text_tensors.size(1) < max_length:
-        padding = torch.zeros((text_tensors.size(0), max_length - text_tensors.size(1)), dtype=torch.float)
-        padded_texts = torch.cat((text_tensors, padding), dim=1)
-    else:
-        padded_texts = text_tensors[:, :max_length]
+    input_ids = text_tensors['input_ids']
+    attention_mask = text_tensors['attention_mask']
     
-    print(f"每个padded_texts的维度: {padded_texts.shape}")
-    return images, padded_texts, labels
+    # print(f"每个input_ids的维度: {input_ids.shape}")
+    # print(f"每个attention_mask的维度: {attention_mask.shape}")
+
+    return images, input_ids, attention_mask, labels
 
 
 
