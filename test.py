@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from data_loader import label_to_text
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
 
 
 def calculate_accuracy(preds, labels):
@@ -20,13 +22,21 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            outputs = model(images, input_ids, attention_mask)
+            _, _, _, _, _, _, _, _, outputs = model(images, input_ids, attention_mask)
             _, preds = torch.max(outputs, 1)
             
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
     
-    accuracy = calculate_accuracy(torch.tensor(all_preds), torch.tensor(all_labels))
+    accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
+    
+    print("\n预测结果:")
+    for pred, label in zip(all_preds[:10], all_labels[:10]):  # 只打印前10个结果
+        pred_text = label_to_text[pred]
+        true_text = label_to_text[label]
+        print(f"预测: {pred_text}, 实际: {true_text}")
+    
+    print(f"\n准确率: {accuracy:.4f}")
     return accuracy
 
 def visualize_predictions(model, dataloader, device):
@@ -37,20 +47,23 @@ def visualize_predictions(model, dataloader, device):
     attention_mask = attention_mask.to(device)
     
     with torch.no_grad():
-        outputs = model(images, input_ids, attention_mask)
+        _, _, _, _, _, _, _, _, outputs = model(images, input_ids, attention_mask)
         _, preds = torch.max(outputs, 1)
     
-    fig, axes = plt.subplots(3, 3, figsize=(10, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     for i, ax in enumerate(axes.flat):
         if i < len(images):
             img = images[i].cpu().squeeze()
             if img.dim() == 1:
-                img = img.view(28, 28)  # 假设图像是 28x28
+                img = img.view(28, 28) 
             ax.imshow(img, cmap='gray')
-            ax.set_title(f'Pred: {preds[i].item()}, True: {labels[i].item()}')
+            pred_text = label_to_text[preds[i].item()]
+            true_text = label_to_text[labels[i].item()]
+            ax.set_title(f'Pred: {pred_text}\nTrue: {true_text}', fontsize=10)
             ax.axis('off')
     
     plt.tight_layout()
-    plt.show()
+    plt.savefig('predictions.png')
+    plt.close()  # 关闭图形以释放内存
 
-    print("\nVisualization saved as 'predictions.png'")
+    print("Visualization results saved to 'predictions.png'")
