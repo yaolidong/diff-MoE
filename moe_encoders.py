@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from positional_encode import positional_encoding
 class MoELayer(nn.Module):
     def __init__(self, input_dim, output_dim, num_experts=10, top_k=2, num_heads=8):
         super().__init__()
@@ -25,7 +25,9 @@ class MoELayer(nn.Module):
         self.layer_norm = nn.LayerNorm(output_dim)
     
     def forward(self, x, attention_mask=None):
+        batch_size, seq_len, _ = x.shape
         x = self.input_projection(x.float())
+
         if attention_mask is not None:
             # 文本输入的情况
             x = x.transpose(0, 1)
@@ -34,8 +36,13 @@ class MoELayer(nn.Module):
             x = x.transpose(0, 1)
         else:
             # 图像输入的情况
+            x = x.transpose(0, 1)
             x, attn_weights = self.multi_head_attention(x, x, x)
+            x = x.transpose(0, 1)
         
+        # 确保attn_weights的形状正确
+        attn_weights = attn_weights.view(batch_size, seq_len, seq_len)
+
         gate_logits = self.gate(x)
         gate_probs = F.softmax(gate_logits, dim=-1)
         
@@ -52,12 +59,8 @@ class MoELayer(nn.Module):
         
         expert_outputs = self.layer_norm(expert_outputs)
         
-        # 确保attn_weights的维度与expert_outputs匹配
-        attn_weights = attn_weights.view(*expert_outputs.shape[:-1], -1)
-        attn_weights = attn_weights.mean(dim=-1, keepdim=True)
-        
         # 使用注意力权重对expert_outputs进行加权
-        weighted_outputs = expert_outputs * attn_weights
+        weighted_outputs = torch.bmm(attn_weights, expert_outputs)
         
         return weighted_outputs, attn_weights
 
@@ -68,8 +71,7 @@ class ImageMoE(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_dim = patch_size * patch_size
-        
-        self.position_embeddings = nn.Parameter(torch.zeros(1, self.num_patches, output_dim))
+        self.output_dim = output_dim
         self.patch_embeddings = nn.Linear(self.patch_dim, output_dim)
         self.first_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
         self.second_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
@@ -79,15 +81,19 @@ class ImageMoE(nn.Module):
     
     def forward(self, x):
         b, c, h, w = x.shape
-        x = x.view(b, c, self.img_size, self.img_size)
+        device = x.device  # 获取输入张量的设备
+
         x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
         x = x.contiguous().view(b, c, -1, self.patch_size * self.patch_size)
-        x = x.permute(0, 2, 3, 1).contiguous().view(b, -1, self.patch_dim)
+        x = x.permute(0, 2, 1, 3).contiguous().view(b, -1, self.patch_dim)
+        
+        # 应用patch嵌入
         x = self.patch_embeddings(x)
         
         # 添加位置编码
-        x = x + self.position_embeddings
-
+        pe = positional_encoding(b, self.num_patches, self.output_dim).to(device)  # 确保位置编码在正确的设备上
+        x = x + pe
+    
         first_output, first_attn_weights = self.first_moe(x)
         first_vector = self.vector(first_output)
         
@@ -98,7 +104,7 @@ class ImageMoE(nn.Module):
         second_attn_weights = second_attn_weights.view(b, -1, 1)
         
         # 使用注意力权重来计算全局向量
-        global_vector = torch.sum(second_vector * second_attn_weights, dim=1)
+        global_vector = torch.sum(second_vector * second_attn_weights.mean(dim=1, keepdim=True), dim=1)
         
         # 生成CLS向量
         cls_vector = self.cls(global_vector)
@@ -117,8 +123,6 @@ class TextMoE(nn.Module):
     
     def forward(self, input_ids, attention_mask):  
         x = self.embedding(input_ids)
-        print(f"{x[0,:,:] == x[1,:,:]}")
-        print(f"{x[1,:,:] == x[2,:,:]}")
         # 添加位置编码
         seq_length = x.size(1)
         x = x + self.position_embeddings[:, :seq_length, :]
@@ -126,7 +130,7 @@ class TextMoE(nn.Module):
         # 应用第一个MoE层
         first_output, first_attn_weights = self.first_moe(x, attention_mask)
         first_vector = self.vector(first_output)
-
+        print(f"attention_mask: {first_attn_weights.shape}")
         
         # 应用第二个MoE层
         second_output, second_attn_weights = self.second_moe(first_vector, attention_mask)
@@ -139,5 +143,5 @@ class TextMoE(nn.Module):
         
         sentence_vector = self.sentence_vector(sentence_vector)
         sentence_vector = self.layer_norm(sentence_vector)
-        
+        sentence_vector= sentence_vector.mean(dim=1)
         return first_vector, second_vector, sentence_vector

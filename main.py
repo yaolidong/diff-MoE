@@ -38,7 +38,6 @@ def main():
         state_dict = {k: v for k, v in state_dict.items() if k in model_dict}
         model_dict.update(state_dict)
         model.load_state_dict(model_dict, strict=False)
-        start_epoch = 0
     
     model.eval()
 
