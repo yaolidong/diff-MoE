@@ -12,7 +12,7 @@ class TextDecoder(nn.Module):
     def forward(self, x, target=None):
         batch_size = x.size(0)
         if target is None:
-            target = torch.zeros(batch_size, self.max_length, dtype=torch.long, device=x.device)
+            target = torch.zeros(batch_size, self.max_length, dtype=torch.float, device=x.device)
         
         embedded = self.embedding(target)
         output, _ = self.rnn(embedded, x.unsqueeze(0))

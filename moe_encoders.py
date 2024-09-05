@@ -22,10 +22,10 @@ class MoELayer(nn.Module):
                 nn.Linear(256, output_dim)
             ) for _ in range(num_experts)
         ])
+        self.layer_norm = nn.LayerNorm(output_dim)
     
     def forward(self, x, attention_mask=None):
         x = self.input_projection(x.float())
-        print(f"x的维度: {x.shape}")
         if attention_mask is not None:
             # 文本输入的情况
             x = x.transpose(0, 1)
@@ -50,7 +50,16 @@ class MoELayer(nn.Module):
                 expert_output = expert(expert_inputs)
                 expert_outputs[mask.any(dim=-1)] += expert_output * top_k_probs[mask].unsqueeze(-1)
         
-        return expert_outputs, attn_weights
+        expert_outputs = self.layer_norm(expert_outputs)
+        
+        # 确保attn_weights的维度与expert_outputs匹配
+        attn_weights = attn_weights.view(*expert_outputs.shape[:-1], -1)
+        attn_weights = attn_weights.mean(dim=-1, keepdim=True)
+        
+        # 使用注意力权重对expert_outputs进行加权
+        weighted_outputs = expert_outputs * attn_weights
+        
+        return weighted_outputs, attn_weights
 
 class ImageMoE(nn.Module):
     def __init__(self, img_size=28, patch_size=4, input_dim=784, output_dim=128, num_experts=10, top_k=2, num_heads=8):
@@ -60,13 +69,13 @@ class ImageMoE(nn.Module):
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_dim = patch_size * patch_size
         
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, output_dim))
         self.position_embeddings = nn.Parameter(torch.zeros(1, self.num_patches, output_dim))
         self.patch_embeddings = nn.Linear(self.patch_dim, output_dim)
-        self.cls = nn.Linear(output_dim, output_dim)
         self.first_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
         self.second_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
         self.vector = nn.Linear(output_dim, output_dim)
+        self.global_vector = nn.Linear(output_dim * self.num_patches, output_dim)
+        self.cls = nn.Linear(output_dim, output_dim)
     
     def forward(self, x):
         b, c, h, w = x.shape
@@ -75,59 +84,60 @@ class ImageMoE(nn.Module):
         x = x.contiguous().view(b, c, -1, self.patch_size * self.patch_size)
         x = x.permute(0, 2, 3, 1).contiguous().view(b, -1, self.patch_dim)
         x = self.patch_embeddings(x)
-        x = x[:, :-1, :]
-        
-        
-        print(f"图像x添加cls前的维度: {x.shape}")
-        # 添加CLS token
-        cls_tokens = self.cls_token.expand(b, -1, -1)
-
-        x = torch.cat((cls_tokens, x), dim=1)
         
         # 添加位置编码
         x = x + self.position_embeddings
 
-        first_output, _ = self.first_moe(x)
+        first_output, first_attn_weights = self.first_moe(x)
         first_vector = self.vector(first_output)
         
-        second_output, _ = self.second_moe(first_vector)
+        second_output, second_attn_weights = self.second_moe(first_vector)
         second_vector = self.vector(second_output)
         
-        cls_first = self.cls(first_output[:, 0])
-        cls_second = self.cls(second_output[:, 0])
+        # 确保second_attn_weights的维度与second_vector匹配
+        second_attn_weights = second_attn_weights.view(b, -1, 1)
         
-        return first_vector, second_vector, cls_first, cls_second
+        # 使用注意力权重来计算全局向量
+        global_vector = torch.sum(second_vector * second_attn_weights, dim=1)
+        
+        # 生成CLS向量
+        cls_vector = self.cls(global_vector)
 
+        return first_vector, second_vector, global_vector, cls_vector
 class TextMoE(nn.Module):
-    def __init__(self, vocab_size, embed_dim=128, output_dim=128, num_experts=10, top_k=2, num_heads=8):
+    def __init__(self, vocab_size, embed_dim=128, output_dim=128, num_experts=10, top_k=2, num_heads=8, max_seq_length=128):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.position_embeddings = nn.Parameter(torch.zeros(1, max_seq_length, embed_dim))
         self.first_moe = MoELayer(embed_dim, output_dim, num_experts, top_k, num_heads)
         self.second_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
-        self.cls = nn.Linear(output_dim, output_dim)
         self.vector = nn.Linear(output_dim, output_dim)
+        self.sentence_vector = nn.Linear(output_dim, output_dim)
+        self.layer_norm = nn.LayerNorm(output_dim)
     
     def forward(self, input_ids, attention_mask):  
         x = self.embedding(input_ids)
+        print(f"{x[0,:,:] == x[1,:,:]}")
+        print(f"{x[1,:,:] == x[2,:,:]}")
+        # 添加位置编码
+        seq_length = x.size(1)
+        x = x + self.position_embeddings[:, :seq_length, :]
         
-        # 添加CLS token
-        b, seq_len, _ = x.shape
-        cls_tokens = self.cls_token.expand(b, -1, -1)
-        x = x[:, :-1, :]
-        x = torch.cat((cls_tokens, x), dim=1)
-        
-        # 更新attention_mask以包含CLS token
-        # attention_mask = torch.cat([torch.ones(b, 1, device=attention_mask.device), attention_mask], dim=1)
-        
-        first_output, _ = self.first_moe(x, attention_mask)
+        # 应用第一个MoE层
+        first_output, first_attn_weights = self.first_moe(x, attention_mask)
         first_vector = self.vector(first_output)
+
         
-        second_output, _ = self.second_moe(first_vector, attention_mask)
+        # 应用第二个MoE层
+        second_output, second_attn_weights = self.second_moe(first_vector, attention_mask)
         second_vector = self.vector(second_output)
         
-        cls_first = self.cls(first_output[:, 0])
-        cls_second = self.cls(second_output[:, 0])
+        # 使用注意力权重和attention_mask来计算句子向量
+        mask = attention_mask.unsqueeze(-1).float()
+        weighted_second_vector = second_vector * second_attn_weights.unsqueeze(-1) * mask
+        sentence_vector = torch.sum(weighted_second_vector, dim=1) / torch.sum(mask, dim=1)
         
-        return first_vector, second_vector, cls_first, cls_second
-
+        sentence_vector = self.sentence_vector(sentence_vector)
+        sentence_vector = self.layer_norm(sentence_vector)
+        
+        return first_vector, second_vector, sentence_vector

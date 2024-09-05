@@ -18,18 +18,32 @@ def main():
     vocab_size = 30522  # 根据实际数据集来设置
     
     model = DualTowerModel(vocab_size=vocab_size, num_classes=10).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # 将学习率从 1e-3 降低到 1e-4
 
-    num_epochs = 1
+    num_epochs = 1  # 增加训练轮数以获得更好的结果
     save_path = "best_model.pth"
 
     train(model, train_dataloader, optimizer, device, num_epochs, save_path)
 
-    model.load_state_dict(torch.load(save_path))
+    # 修改这里的加载代码
+    checkpoint = torch.load(save_path)
+    if 'model_version' in checkpoint and checkpoint['model_version'] == '1.1':
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+    else:
+        print("Loading old model version, initializing new layers...")
+        state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) else checkpoint
+        model_dict = model.state_dict()
+        state_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+        model_dict.update(state_dict)
+        model.load_state_dict(model_dict, strict=False)
+        start_epoch = 0
+    
     model.eval()
 
     test_accuracy = test(model, test_dataloader, device)
-    print(f"Test Accuracy: {test_accuracy:.4f}")
+    print(f"测试准确率: {test_accuracy:.4f}")
 
     visualize_predictions(model, test_dataloader, device)
 

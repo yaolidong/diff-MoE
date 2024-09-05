@@ -18,12 +18,12 @@ def collate_fn(batch, augmentation):
     
     # 原始图像
     original_images = [augmentation(img) for img in images]
-    print(f"原始图像维度: {[img.shape for img in original_images]}")
+    # print(f"原始图像维度: {[img.shape for img in original_images]}")
     original_images = torch.stack(original_images)
     
     # 增强图像
     augmented_images = [augmentation(img) for img in images]
-    print(f"增强图像维度: {[img.shape for img in augmented_images]}")
+    # print(f"增强图像维度: {[img.shape for img in augmented_images]}")
     augmented_images = torch.stack(augmented_images)
     
     labels = torch.tensor(labels)
@@ -32,12 +32,12 @@ def collate_fn(batch, augmentation):
     texts = [label_to_text[label.item()] for label in labels]
 
     tokenizer = BertTokenizer.from_pretrained("./bert-base-uncased")
-    text_tensors = tokenizer(texts, padding='max_length', truncation=True, max_length=49, return_tensors="pt")
+    text_tensors = tokenizer(texts, padding='max_length', truncation=True, max_length=128, return_tensors="pt")
     
     input_ids = text_tensors['input_ids']
     attention_mask = text_tensors['attention_mask']
     
-    return original_images, augmented_images, input_ids, attention_mask, labels
+    return original_images, input_ids, attention_mask, labels
 
 
 

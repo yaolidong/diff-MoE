@@ -13,14 +13,15 @@ class DualTowerModel(nn.Module):
         self.classifier = nn.Linear(128, num_classes)
 
     def forward(self, images, input_ids, attention_mask):
-        image_first_vector, image_second_vector, image_cls_first, image_cls_second = self.image_tower(images)
-        text_first_vector, text_second_vector, text_cls_first, text_cls_second = self.text_tower(input_ids, attention_mask)
-        print(f"image_second_vector的维度: {image_second_vector.shape}")
-        print(f"text_second_vector的维度: {text_second_vector.shape}")
+        image_first_vector, image_second_vector, image_global_vector, image_cls = self.image_tower(images)
+        text_first_vector, text_second_vector, sentence_vector = self.text_tower(input_ids, attention_mask)
 
-        cross_attention_output = self.cross_attention(image_second_vector, text_second_vector)  # 确保传入两个参数
-        print(f"cross_attention_output的维度: {cross_attention_output.shape}")
+        # 应用交叉注意力
+        cross_attention_output = self.cross_attention(image_global_vector, sentence_vector)
         cross_attention_output = cross_attention_output.mean(dim=1)  # 平均池化
-        print(f"平均池化后的cross_attention_output的维度: {cross_attention_output.shape}")
-        return image_first_vector, image_second_vector, image_cls_first, image_cls_second, \
-               text_first_vector, text_second_vector, text_cls_first, text_cls_second
+        
+        # 使用 classifier 层生成分类预测
+        classification_output = self.classifier(cross_attention_output)
+        
+        return classification_output, image_first_vector, image_second_vector, image_global_vector, image_cls, \
+               text_first_vector, text_second_vector, sentence_vector

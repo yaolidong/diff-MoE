@@ -22,7 +22,7 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            _, _, _, _, _, _, _, _, outputs = model(images, input_ids, attention_mask)
+            outputs, _, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
             _, preds = torch.max(outputs, 1)
             
             all_preds.extend(preds.cpu().tolist())
@@ -31,6 +31,7 @@ def test(model, dataloader, device):
     accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
     
     print("\n预测结果:")
+    print_output_distribution(outputs)
     for pred, label in zip(all_preds[:10], all_labels[:10]):  # 只打印前10个结果
         pred_text = label_to_text[pred]
         true_text = label_to_text[label]
@@ -47,7 +48,7 @@ def visualize_predictions(model, dataloader, device):
     attention_mask = attention_mask.to(device)
     
     with torch.no_grad():
-        _, _, _, _, _, _, _, _, outputs = model(images, input_ids, attention_mask)
+        outputs, _, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
         _, preds = torch.max(outputs, 1)
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
@@ -67,3 +68,12 @@ def visualize_predictions(model, dataloader, device):
     plt.close()  # 关闭图形以释放内存
 
     print("Visualization results saved to 'predictions.png'")
+
+def print_output_distribution(outputs):
+    probs = F.softmax(outputs, dim=1)
+    avg_probs = probs.mean(dim=0)
+    for i, prob in enumerate(avg_probs):
+        print(f"Class {i}: {prob.item():.4f}")
+
+# 在测试函数中添加：
+
