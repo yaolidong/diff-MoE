@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from losses import contrastive_loss, compute_loss  # 导入新的loss函数
+from losses import contrastive_loss
 
 def train(model, dataloader, optimizer, device, num_epochs, save_path):
     best_loss = float('inf')
@@ -19,22 +19,22 @@ def train(model, dataloader, optimizer, device, num_epochs, save_path):
 
             # 原始图像前向传播
             orig_image_first, orig_image_second, orig_image_cls_first, orig_image_cls_second, \
-            text_first, text_second, text_cls_first, text_cls_second, orig_outputs = model(original_images, input_ids, attention_mask)
+            text_first, text_second, text_cls_first, text_cls_second= model(original_images, input_ids, attention_mask)
 
             # 增强图像前向传播
-            aug_image_first, aug_image_second, aug_image_cls_first, aug_image_cls_second, \
-            _, _, _, _, aug_outputs = model(augmented_images, input_ids, attention_mask)
+            # aug_image_first, aug_image_second, aug_image_cls_first, aug_image_cls_second, \
+            # _, _, _, _ = model(augmented_images, input_ids, attention_mask)
             print(f"orig_image_second的维度: {orig_image_second.shape}")
-            print(f"aug_image_second的维度: {aug_image_second.shape}")
+            print(f"text_second的维度: {text_second.shape}")
             # 计算对比损失
-            loss_image = contrastive_loss(orig_image_second, aug_image_second)
-            # loss_text_image = contrastive_loss(text_second, orig_image_second)
+            loss_image = contrastive_loss(orig_image_second, text_second)
+            loss_text_image = contrastive_loss(text_second, orig_image_second)
 
             # 计算分类损失
-            loss_cls = F.cross_entropy(orig_outputs, labels) + F.cross_entropy(aug_outputs, labels)
+            loss_cls = F.cross_entropy(text_cls_second, labels) + F.cross_entropy(orig_image_cls_second, labels)
 
             # 总损失
-            loss = loss_image + loss_cls
+            loss = loss_image + loss_cls + loss_text_image
 
             loss.backward()
             optimizer.step()

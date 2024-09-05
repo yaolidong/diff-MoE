@@ -18,15 +18,9 @@ class DualTowerModel(nn.Module):
         print(f"image_second_vector的维度: {image_second_vector.shape}")
         print(f"text_second_vector的维度: {text_second_vector.shape}")
 
-        # 确保 image_second_vector 和 text_second_vector 具有相同的维度
-        if image_second_vector.dim() == 2:
-            image_second_vector = image_second_vector.unsqueeze(1)
-        if text_second_vector.dim() == 2:
-            text_second_vector = text_second_vector.unsqueeze(1)
-
         cross_attention_output = self.cross_attention(image_second_vector, text_second_vector)  # 确保传入两个参数
+        print(f"cross_attention_output的维度: {cross_attention_output.shape}")
         cross_attention_output = cross_attention_output.mean(dim=1)  # 平均池化
-        outputs = self.classifier(cross_attention_output)
-
+        print(f"平均池化后的cross_attention_output的维度: {cross_attention_output.shape}")
         return image_first_vector, image_second_vector, image_cls_first, image_cls_second, \
-               text_first_vector, text_second_vector, text_cls_first, text_cls_second, outputs
+               text_first_vector, text_second_vector, text_cls_first, text_cls_second

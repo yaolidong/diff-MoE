@@ -60,41 +60,49 @@ class ImageMoE(nn.Module):
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_dim = patch_size * patch_size
         
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, output_dim))
         self.position_embeddings = nn.Parameter(torch.zeros(1, self.num_patches, output_dim))
         self.patch_embeddings = nn.Linear(self.patch_dim, output_dim)
-        
+        self.cls = nn.Linear(output_dim, output_dim)
         self.first_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
         self.second_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
-        self.cls = nn.Linear(output_dim, output_dim)
         self.vector = nn.Linear(output_dim, output_dim)
     
     def forward(self, x):
-        # 将图像分成patch
         b, c, h, w = x.shape
         x = x.view(b, c, self.img_size, self.img_size)
         x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
         x = x.contiguous().view(b, c, -1, self.patch_size * self.patch_size)
         x = x.permute(0, 2, 3, 1).contiguous().view(b, -1, self.patch_dim)
+        x = self.patch_embeddings(x)
+        x = x[:, :-1, :]
+        
+        
+        print(f"图像x添加cls前的维度: {x.shape}")
+        # 添加CLS token
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+
+        x = torch.cat((cls_tokens, x), dim=1)
         
         # 添加位置编码
-        x = self.patch_embeddings(x) + self.position_embeddings
+        x = x + self.position_embeddings
 
-        print(f"图像维度: {x.shape}")
         first_output, _ = self.first_moe(x)
         first_vector = self.vector(first_output)
-        print(f"first_output维度: {first_output.shape}")
+        
         second_output, _ = self.second_moe(first_vector)
-        print(f"second_output维度: {second_output.shape}")
         second_vector = self.vector(second_output)
-        cls_first = self.cls(first_output)
-        cls_second = self.cls(second_output)
-
+        
+        cls_first = self.cls(first_output[:, 0])
+        cls_second = self.cls(second_output[:, 0])
         
         return first_vector, second_vector, cls_first, cls_second
+
 class TextMoE(nn.Module):
     def __init__(self, vocab_size, embed_dim=128, output_dim=128, num_experts=10, top_k=2, num_heads=8):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.first_moe = MoELayer(embed_dim, output_dim, num_experts, top_k, num_heads)
         self.second_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
         self.cls = nn.Linear(output_dim, output_dim)
@@ -103,14 +111,23 @@ class TextMoE(nn.Module):
     def forward(self, input_ids, attention_mask):  
         x = self.embedding(input_ids)
         
+        # 添加CLS token
+        b, seq_len, _ = x.shape
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        x = x[:, :-1, :]
+        x = torch.cat((cls_tokens, x), dim=1)
+        
+        # 更新attention_mask以包含CLS token
+        # attention_mask = torch.cat([torch.ones(b, 1, device=attention_mask.device), attention_mask], dim=1)
+        
         first_output, _ = self.first_moe(x, attention_mask)
         first_vector = self.vector(first_output)
         
         second_output, _ = self.second_moe(first_vector, attention_mask)
         second_vector = self.vector(second_output)
-        cls_first = self.cls(first_output)
-        cls_second = self.cls(second_output)
         
+        cls_first = self.cls(first_output[:, 0])
+        cls_second = self.cls(second_output[:, 0])
         
         return first_vector, second_vector, cls_first, cls_second
 

@@ -3,14 +3,19 @@ from model import DualTowerModel
 from data_loader import get_data_loaders
 from train import train
 from test import test, visualize_predictions
+import platform
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if platform.system() == 'Darwin':  # macOS
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    else:  # Windows or other
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     print(f"Using device: {device}")
 
     train_dataloader, test_dataloader = get_data_loaders()
 
-    vocab_size = 30522  # 这里需要根据您的实际数据集来设置
+    vocab_size = 30522  # 根据实际数据集来设置
     
     model = DualTowerModel(vocab_size=vocab_size, num_classes=10).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)

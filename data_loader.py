@@ -32,7 +32,7 @@ def collate_fn(batch, augmentation):
     texts = [label_to_text[label.item()] for label in labels]
 
     tokenizer = BertTokenizer.from_pretrained("./bert-base-uncased")
-    text_tensors = tokenizer(texts, padding='max_length', truncation=True, max_length=128, return_tensors="pt")
+    text_tensors = tokenizer(texts, padding='max_length', truncation=True, max_length=49, return_tensors="pt")
     
     input_ids = text_tensors['input_ids']
     attention_mask = text_tensors['attention_mask']
