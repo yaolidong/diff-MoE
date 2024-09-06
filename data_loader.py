@@ -9,8 +9,8 @@ def get_data_loaders(batch_size=128):
     augmentation = get_augmentation()
     train_dataset = torchvision.datasets.FashionMNIST(root="./data", train=True, download=True, transform=None)
     test_dataset = torchvision.datasets.FashionMNIST(root="./data", train=False, download=True, transform=None)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, augmentation))
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, augmentation))
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=lambda x: collate_fn(x, augmentation))
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=lambda x: collate_fn(x, augmentation))
     return train_dataloader, test_dataloader
 
 def collate_fn(batch, augmentation):

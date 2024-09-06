@@ -16,6 +16,7 @@ class DualTowerModel(nn.Module):
         image_first_vector, image_second_vector, image_global_vector, image_cls = self.image_tower(images)
         text_first_vector, text_second_vector, sentence_vector = self.text_tower(input_ids, attention_mask)
 
+
         # 应用交叉注意力
         cross_attention_output = self.cross_attention(image_global_vector, sentence_vector)
         cross_attention_output = cross_attention_output.mean(dim=1)  # 平均池化

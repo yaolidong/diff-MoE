@@ -2,6 +2,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from positional_encode import positional_encoding
+import mHselfAttention
+from NoisyTopkRouter import NoisyTopkRouter
+
+class SparseMoE(nn.Module):
+    def __init__(self, n_embd, top_k, num_experts, dropout):
+        super(SparseMoE, self).__init__()
+        self.experts = nn.ModuleList([mHselfAttention.Expert(n_embd, dropout) for _ in range(num_experts)])
+        self.router = NoisyTopkRouter(n_embd, top_k, num_experts)
+        self.top_k = top_k
+
+    def forward(self, x):
+        gating_output, indices = self.router(x)  # 路由器输出top_k 专家softmax概率和专家索引
+        final_output = torch.zeros_like(x)  # 初始化最终输出
+
+        # 三维转二维
+        flat_x = x.view(-1, x.size(-1))  # flatten x, x.size(-1)最后一个维度数，-1表示自动计算
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))  # gating_output.size(-1) = num_experts
+
+        for i, expert in enumerate(self.experts):
+            expert_mask = (indices == i).any(dim=-1)  # 创建一个掩码，指示哪些位置由专家i处理
+            flat_mask = expert_mask.view(-1)  # 沿最后的维度展平
+
+            if flat_mask.any():
+                expert_input = flat_x[flat_mask]  # 从输入中提取专家i需要处理的数据
+                expert_output = expert(expert_input)  # 专家i处理tokens并输出
+
+                gating_scores = flat_gating_output[flat_mask, i].unsqueeze(1)  # 从路由器输出矩阵中提取专家i的概率
+                weighted_output = expert_output * gating_scores  # 乘以概率
+
+                final_output[expert_mask] += weighted_output.squeeze(1)  # 将加权输出添加到最终输出中
+
+        return final_output
+
 class MoELayer(nn.Module):
     def __init__(self, input_dim, output_dim, num_experts=10, top_k=2, num_heads=8):
         super().__init__()
@@ -12,57 +45,34 @@ class MoELayer(nn.Module):
         self.adjusted_dim = ((input_dim - 1) // num_heads + 1) * num_heads
         self.input_projection = nn.Linear(input_dim, self.adjusted_dim)
         
-        self.multi_head_attention = nn.MultiheadAttention(self.adjusted_dim, num_heads)
+        # 修改这里以使用mHselfAttention中的MultiHeadAttention
+        self.multi_head_attention = mHselfAttention.MultiHeadAttention(
+            block_size=self.adjusted_dim,
+            head_size=self.adjusted_dim // num_heads,
+            n_head=num_heads,
+            n_embd=self.adjusted_dim,
+            dropout=0.1
+        )
         
-        self.gate = nn.Linear(self.adjusted_dim, num_experts)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.adjusted_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, output_dim)
-            ) for _ in range(num_experts)
-        ])
+        self.sparse_moe = SparseMoE(self.adjusted_dim, top_k, num_experts, dropout=0.1)
         self.layer_norm = nn.LayerNorm(output_dim)
+        self.dropout = nn.Dropout(0.1)
     
     def forward(self, x, attention_mask=None):
-        batch_size, seq_len, _ = x.shape
         x = self.input_projection(x.float())
+        x = self.dropout(x)
 
-        if attention_mask is not None:
-            # 文本输入的情况
-            x = x.transpose(0, 1)
-            attention_mask = attention_mask.to(dtype=torch.bool)
-            x, attn_weights = self.multi_head_attention(x, x, x, key_padding_mask=attention_mask)
-            x = x.transpose(0, 1)
-        else:
-            # 图像输入的情况
-            x = x.transpose(0, 1)
-            x, attn_weights = self.multi_head_attention(x, x, x)
-            x = x.transpose(0, 1)
+        # 注意：mHselfAttention.MultiHeadAttention 不接受 attention_mask 参数
+        x = self.multi_head_attention(x)
         
-        # 确保attn_weights的形状正确
-        attn_weights = attn_weights.view(batch_size, seq_len, seq_len)
-
-        gate_logits = self.gate(x)
-        gate_probs = F.softmax(gate_logits, dim=-1)
+        x = self.dropout(x)
         
-        top_k_probs, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
-        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-        
-        expert_outputs = torch.zeros(*x.shape[:-1], self.output_dim, device=x.device)
-        for i, expert in enumerate(self.experts):
-            mask = top_k_indices == i
-            if mask.any():
-                expert_inputs = x[mask.any(dim=-1)]
-                expert_output = expert(expert_inputs)
-                expert_outputs[mask.any(dim=-1)] += expert_output * top_k_probs[mask].unsqueeze(-1)
+        expert_outputs = self.sparse_moe(x)
         
         expert_outputs = self.layer_norm(expert_outputs)
-        
-        # 使用注意力权重对expert_outputs进行加权
-        weighted_outputs = torch.bmm(attn_weights, expert_outputs)
-        
-        return weighted_outputs, attn_weights
+        expert_outputs = self.dropout(expert_outputs)
+    
+        return expert_outputs, None  # 返回 None 作为 attn_weights，因为 mHselfAttention.MultiHeadAttention 不返回注意力权重
 
 class ImageMoE(nn.Module):
     def __init__(self, img_size=28, patch_size=4, input_dim=784, output_dim=128, num_experts=10, top_k=2, num_heads=8):
@@ -110,31 +120,42 @@ class ImageMoE(nn.Module):
         cls_vector = self.cls(global_vector)
 
         return first_vector, second_vector, global_vector, cls_vector
+
 class TextMoE(nn.Module):
     def __init__(self, vocab_size, embed_dim=128, output_dim=128, num_experts=10, top_k=2, num_heads=8, max_seq_length=128):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.position_embeddings = nn.Parameter(torch.zeros(1, max_seq_length, embed_dim))
         self.first_moe = MoELayer(embed_dim, output_dim, num_experts, top_k, num_heads)
         self.second_moe = MoELayer(output_dim, output_dim, num_experts, top_k, num_heads)
         self.vector = nn.Linear(output_dim, output_dim)
         self.sentence_vector = nn.Linear(output_dim, output_dim)
         self.layer_norm = nn.LayerNorm(output_dim)
+        self.dropout = nn.Dropout(0.1)
     
     def forward(self, input_ids, attention_mask):  
         x = self.embedding(input_ids)
-        # 添加位置编码
-        seq_length = x.size(1)
-        x = x + self.position_embeddings[:, :seq_length, :]
+        b, seq_length, embed_dim = x.shape
         
-        # 应用第一个MoE层
+        # 添加位置编码
+        pe = positional_encoding(b, seq_length, embed_dim).to(x.device)
+        x = x + pe
+        x = self.dropout(x)
+        
+        print(f"Embedding stats: mean={x.mean().item():.4f}, std={x.std().item():.4f}")
+        
         first_output, first_attn_weights = self.first_moe(x, attention_mask)
         first_vector = self.vector(first_output)
-        print(f"attention_mask: {first_attn_weights.shape}")
+        first_vector = self.dropout(first_vector)
         
-        # 应用第二个MoE层
+        print(f"First MoE output stats: mean={first_vector.mean().item():.4f}, std={first_vector.std().item():.4f}")
+        print(f"First attn weights stats: mean={first_attn_weights.mean().item():.4f}, std={first_attn_weights.std().item():.4f}")
+        
         second_output, second_attn_weights = self.second_moe(first_vector, attention_mask)
         second_vector = self.vector(second_output)
+        second_vector = self.dropout(second_vector)
+        
+        print(f"Second MoE output stats: mean={second_vector.mean().item():.4f}, std={second_vector.std().item():.4f}")
+        print(f"Second attn weights stats: mean={second_attn_weights.mean().item():.4f}, std={second_attn_weights.std().item():.4f}")
         
         # 使用注意力权重和attention_mask来计算句子向量
         mask = attention_mask.unsqueeze(-1).float()
@@ -143,5 +164,12 @@ class TextMoE(nn.Module):
         
         sentence_vector = self.sentence_vector(sentence_vector)
         sentence_vector = self.layer_norm(sentence_vector)
-        sentence_vector= sentence_vector.mean(dim=1)
-        return first_vector, second_vector, sentence_vector
+        sentence_vector = self.dropout(sentence_vector)
+        
+        print(f"Final sentence vector stats: mean={sentence_vector.mean().item():.4f}, std={sentence_vector.std().item():.4f}")
+        
+        if b > 1:
+            print(f"Are all sentence vectors the same? {torch.allclose(sentence_vector[0], sentence_vector[1], atol=1e-6)}")
+            print(f"Sentence vector difference: {(sentence_vector[0] - sentence_vector[1]).abs().mean().item():.6f}")
+        
+        return first_vector, second_vector, sentence_vector.mean(dim=1)

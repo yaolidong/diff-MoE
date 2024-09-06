@@ -22,7 +22,7 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            outputs, _, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
+            outputs, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
             _, preds = torch.max(outputs, 1)
             
             all_preds.extend(preds.cpu().tolist())
