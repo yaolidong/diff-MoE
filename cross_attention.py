@@ -4,9 +4,10 @@ import torch.nn.functional as F
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8):
+    def __init__(self, dim=1024, num_heads=8):
         super().__init__()
         self.num_heads = num_heads
+        # 64
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 

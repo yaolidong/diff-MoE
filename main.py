@@ -17,7 +17,7 @@ def main():
 
     vocab_size = 30522  # 根据实际数据集来设置
     
-    model = DualTowerModel(vocab_size=vocab_size, num_classes=10).to(device)
+    model = DualTowerModel(vocab_size=vocab_size, output_dim=1024, n_head=8, num_classes=10).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # 将学习率从 1e-3 降低到 1e-4
 
     num_epochs = 1  # 增加训练轮数以获得更好的结果

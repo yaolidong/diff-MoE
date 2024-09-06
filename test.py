@@ -22,8 +22,9 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            outputs, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
-            _, preds = torch.max(outputs, 1)
+            classification_output, image_first_vector, image_second_vector, image_vector, image_cls, \
+               text_first_vector, text_second_vector, text_vector, text_cls = model(images, input_ids, attention_mask)
+            _, preds = torch.max(classification_output, 1)
             
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
@@ -31,7 +32,7 @@ def test(model, dataloader, device):
     accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
     
     print("\n预测结果:")
-    print_output_distribution(outputs)
+    print_output_distribution(classification_output)
     for pred, label in zip(all_preds[:10], all_labels[:10]):  # 只打印前10个结果
         pred_text = label_to_text[pred]
         true_text = label_to_text[label]
