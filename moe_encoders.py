@@ -57,7 +57,7 @@ class ImageMoE(nn.Module):
         self.ln3 = nn.LayerNorm(output_dim)
         self.first_moe = SparseMoE(output_dim, top_k, num_experts)
         self.second_moe = SparseMoE(output_dim, top_k, num_experts)
-        self.cls = nn.Linear(output_dim, 1)
+        self.cls = nn.Linear(output_dim, 10)
     
     def forward(self, x):
         b, c, h, w = x.shape
@@ -94,7 +94,7 @@ class TextMoE(nn.Module):
         self.ln3 = nn.LayerNorm(output_dim)
         self.first_moe = SparseMoE(output_dim, top_k, num_experts)
         self.second_moe = SparseMoE(output_dim, top_k, num_experts)
-        self.cls = nn.Linear(output_dim, 1)
+        self.cls = nn.Linear(output_dim, 10)
     def forward(self, input_ids, attention_mask):  
         # 词嵌入[128,16,128]
         x = self.embedding(input_ids)

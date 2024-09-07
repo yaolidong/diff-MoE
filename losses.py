@@ -1,34 +1,42 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-def contrastive_loss(features1, features2, temperature=0.5):
-    batch_size = features1.shape[0]
-    features = torch.cat([features1, features2], dim=0)
-    
-    # 计算相似度矩阵
-    similarity_matrix = torch.matmul(features, features.T)
-    
-    # 创建标签
-    labels = torch.arange(batch_size, device=features.device)
-    labels = torch.cat([labels, labels], dim=0)
-    
-    # 创建掩码以排除自身比较
-    mask = torch.eye(2*batch_size, dtype=torch.bool, device=features.device)
-    
-    # 应用掩码，但保持原始形状
-    similarity_matrix_masked = similarity_matrix.masked_fill(mask, float('-inf'))
-    
-    # 创建正例和负例的标签
-    pos_label = labels.unsqueeze(0) == labels.unsqueeze(1)
-    
-    # 提取正例和负例
-    positives = similarity_matrix_masked[pos_label & (~mask)].view(2*batch_size, -1)
-    negatives = similarity_matrix_masked[~pos_label].view(2*batch_size, -1)
-    
-    logits = torch.cat([positives, negatives], dim=1)
-    labels = torch.zeros(2*batch_size, dtype=torch.long, device=features.device)
-    
-    return F.cross_entropy(logits / temperature, labels)
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=1.0, temperature=0.5):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+        self.temperature = temperature
+
+    def forward(self, image_first_vector, image_second_vector, text_first_vector, text_second_vector, labels):
+        # 计算图像和文本之间的对比损失
+        loss_image_text = self.compute_pairwise_loss(image_second_vector, text_second_vector, labels)
+        
+        # 计算图像内部的对比损失
+        loss_image = self.compute_pairwise_loss(image_first_vector, image_second_vector, labels)
+        
+        # 计算文本内部的对比损失
+        loss_text = self.compute_pairwise_loss(text_first_vector, text_second_vector, labels)
+        
+        # 总损失是这三个损失的加权和
+        total_loss = loss_image_text + 0.5 * loss_image + 0.5 * loss_text
+        
+        return total_loss
+
+    def compute_pairwise_loss(self, features1, features2, labels):
+        batch_size = features1.shape[0]
+        
+        # 计算余弦相似度
+        similarity = F.cosine_similarity(features1, features2, dim=1)
+        
+        # 计算正例和负例的损失
+        positive_loss = (1 - labels) * torch.pow(1 - similarity, 2)
+        negative_loss = labels * torch.pow(torch.clamp(similarity - self.margin, min=0.0), 2)
+        
+        loss = 0.5 * (positive_loss + negative_loss)
+        
+        return loss.mean() / self.temperature
 
 def compute_loss(outputs, labels):
     return F.cross_entropy(outputs, labels)
+
