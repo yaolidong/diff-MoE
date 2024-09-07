@@ -32,7 +32,6 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch']
     else:
-        print("Loading old model version, initializing new layers...")
         state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) else checkpoint
         model_dict = model.state_dict()
         state_dict = {k: v for k, v in state_dict.items() if k in model_dict}

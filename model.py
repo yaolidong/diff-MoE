@@ -16,19 +16,13 @@ class DualTowerModel(nn.Module):
         image_first_vector, image_second_vector, image_vector, image_cls = self.image_tower(images)
         text_first_vector, text_second_vector, text_vector, text_cls = self.text_tower(input_ids, attention_mask)
         
-        print("Image vector shape:", image_vector.shape)
-        print("Text vector shape:", text_vector.shape)
-        
         # 应用交叉注意力
         cross_attention_output = self.cross_attention(image_vector, text_vector)
-        print("Cross attention output shape:", cross_attention_output.shape)
         
         cross_attention_output = cross_attention_output.mean(dim=1)  # 平均池化
-        print("Pooled cross attention output shape:", cross_attention_output.shape)
         
         # 使用 classifier 层生成分类预测
         classification_output = self.classifier(cross_attention_output)
-        print("Classification output shape:", classification_output.shape)
         
         return classification_output, image_first_vector, image_second_vector, image_vector, image_cls, \
                text_first_vector, text_second_vector, text_vector, text_cls
