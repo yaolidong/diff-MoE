@@ -74,13 +74,12 @@ class ImageMoE(nn.Module):
         x = x + self.positional_encoding.to(x.device)
         x = x + self.sa(self.ln1(x))
         x = self.proj(x)
-        first_output = self.first_moe(self.ln2(x))
-        second_output = self.second_moe(self.ln3(x))
-        image_vector = second_output.mean(dim=1)
+        first_output = self.first_moe(self.ln2(x)).mean(dim=1)
+        second_output = self.second_moe(self.ln3(x)).mean(dim=1)
         # 生成CLS向量
-        cls_vector = self.cls(image_vector)
+        cls_vector = self.cls(second_output)
 
-        return first_output, second_output, image_vector, cls_vector
+        return first_output, second_output, cls_vector
 
 class TextMoE(nn.Module):
     def __init__(self, vocab_size, seq_length=16, embed_dim=128, output_dim=1024, num_experts=10, top_k=2):
@@ -103,9 +102,8 @@ class TextMoE(nn.Module):
         x = x + self.positional_encoding.to(x.device)
         x = x + self.sa(self.ln1(x))
         x = self.proj(x)
-        first_output = self.first_moe(self.ln2(x))
-        second_output = self.second_moe(self.ln3(x))
+        first_output = self.first_moe(self.ln2(x)).mean(dim=1)
+        second_output = self.second_moe(self.ln3(x)).mean(dim=1)
 
-        text_vector = second_output.mean(dim=1)
-        text_cls = self.cls(text_vector)  
-        return first_output, second_output, text_vector, text_cls
+        text_cls = self.cls(second_output)  
+        return first_output, second_output, text_cls

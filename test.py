@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from data_loader import label_to_text
 import matplotlib
-matplotlib.use('Agg')  # 使用非交互式后端
+matplotlib.use('Agg') 
 
 
 def calculate_accuracy(preds, labels):
@@ -22,8 +22,8 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            classification_output, image_first_vector, image_second_vector, image_vector, image_cls, \
-               text_first_vector, text_second_vector, text_vector, text_cls = model(images, input_ids, attention_mask)
+            classification_output, image_first_vector, image_second_vector,  image_cls, \
+               text_first_vector, text_second_vector, text_cls = model(images, input_ids, attention_mask)
             _, preds = torch.max(classification_output, 1)
             
             all_preds.extend(preds.cpu().tolist())
@@ -49,7 +49,7 @@ def visualize_predictions(model, dataloader, device):
     attention_mask = attention_mask.to(device)
     
     with torch.no_grad():
-        outputs, _, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
+        outputs, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
         _, preds = torch.max(outputs, 1)
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
@@ -76,5 +76,4 @@ def print_output_distribution(outputs):
     for i, prob in enumerate(avg_probs):
         print(f"Class {i}: {prob.item():.4f}")
 
-# 在测试函数中添加：
 

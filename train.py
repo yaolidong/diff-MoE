@@ -17,20 +17,19 @@ def train(model, dataloader, optimizer, device, num_epochs, save_path):
             
             optimizer.zero_grad()
 
-            classification_output, image_first_vector, image_second_vector, image_vector, image_cls, \
-            text_first_vector, text_second_vector, text_vector, text_cls= model(original_images, input_ids, attention_mask)
-
-            loss_text_image = contrastive_loss(image_vector, text_vector)
-            loss_cls = F.cross_entropy(classification_output, labels)
-            loss = loss_cls + 0.5 * loss_text_image  # 可以调整对比损失的权重
+            classification_output, image_first_vector, image_second_vector, image_cls, \
+            text_first_vector, text_second_vector, text_cls= model(original_images, input_ids, attention_mask)
+            loss_image = contrastive_loss(image_first_vector, image_second_vector)
+            loss_text = contrastive_loss(text_first_vector, text_second_vector)
+            loss_text_image = contrastive_loss(image_second_vector, text_second_vector)
+            loss_image_cls = F.cross_entropy(image_cls, labels)
+            loss_text_cls = F.cross_entropy(text_cls, labels)
+            loss = loss_image_cls + loss_text_cls + 0.5 * loss_text_image + 0.5 * loss_text + 0.5 * loss_image  # 可以调整对比损失的权重
 
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-
-            if batch_idx % 100 == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}, Total Loss: {loss.item():.4f}, Cls Loss: {loss_cls.item():.4f}, Contrastive Loss: {loss_text_image.item():.4f}")
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
