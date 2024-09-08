@@ -49,7 +49,7 @@ def visualize_predictions(model, dataloader, device):
     attention_mask = attention_mask.to(device)
     
     with torch.no_grad():
-        outputs, _, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
+        outputs, _, _, _, _, _, _ = model(images, input_ids, attention_mask)
         _, preds = torch.max(outputs, 1)
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))

@@ -20,7 +20,7 @@ def main():
     model = DualTowerModel(vocab_size=vocab_size, output_dim=1024, n_head=8, num_classes=10).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # 将学习率从 1e-3 降低到 1e-4
 
-    num_epochs = 1  # 增加训练轮数以获得更好的结果
+    num_epochs = 10  # 增加训练轮数以获得更好的结果
     save_path = "best_model.pth"
 
     train(model, train_dataloader, optimizer, device, num_epochs, save_path)
