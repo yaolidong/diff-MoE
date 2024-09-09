@@ -32,7 +32,7 @@ def train(model, dataloader, optimizer, device, num_epochs, save_path):
             loss_text_cls = criterion(text_cls, labels)
 
             # 总损失是对比损失和分类损失的加权和
-            loss = loss_image_cls + loss_text_cls
+            loss = loss_image_cls + loss_text_cls + contrastive_loss
 
             loss.backward()
             optimizer.step()
