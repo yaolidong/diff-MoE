@@ -1,13 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from losses import CLIPLoss
+from cross_attention import CrossAttention
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
 
 def train(model, dataloader, optimizer, device, num_epochs, save_path):
     clip_loss = CLIPLoss().to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss().to(device)
+    cross_attn = CrossAttention().to(device)
 
     for epoch in range(num_epochs):
         model.train()
@@ -26,13 +29,13 @@ def train(model, dataloader, optimizer, device, num_epochs, save_path):
             # 计算CLIP风格的对比损失
             contrastive_loss = clip_loss(image_second_vector, text_second_vector, labels)
 
-            # 计算分类损失
             classification_loss = criterion(classification_output, labels)
+            # 计算分类损失
             loss_image_cls = criterion(image_cls, labels)
             loss_text_cls = criterion(text_cls, labels)
 
-            # 总损失是对比损失和分类损失的加权和
-            loss = loss_image_cls + loss_text_cls + contrastive_loss
+            # 总损失
+            loss = contrastive_loss + classification_loss + loss_image_cls + loss_text_cls
 
             loss.backward()
             optimizer.step()
@@ -40,7 +43,15 @@ def train(model, dataloader, optimizer, device, num_epochs, save_path):
             total_loss += loss.item()
 
         avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
+        avg_contrastive_loss = contrastive_loss.item() / len(dataloader)
+        avg_classification_loss = classification_loss.item() / len(dataloader)
+        avg_loss_image_cls = loss_image_cls.item() / len(dataloader)
+        avg_loss_text_cls = loss_text_cls.item() / len(dataloader)
+        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}, "
+              f"Contrastive Loss: {avg_contrastive_loss:.4f}, "
+              f"Classification Loss: {avg_classification_loss:.4f}, "
+              f"Image CLS Loss: {avg_loss_image_cls:.4f}, "
+              f"Text CLS Loss: {avg_loss_text_cls:.4f}")
 
     torch.save({
         'model_state_dict': model.state_dict(),
