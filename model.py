@@ -13,16 +13,16 @@ class DualTowerModel(nn.Module):
         self.classifier = nn.Linear(output_dim, num_classes)
 
     def forward(self, images, input_ids, attention_mask):
-        image_first_vector, image_second_vector, image_cls = self.image_tower(images)
-        text_first_vector, text_second_vector, text_cls = self.text_tower(input_ids, attention_mask)
+        image_first_vector, image_second_vector, image_cls_vector, image_cls = self.image_tower(images)
+        text_first_vector, text_second_vector, text_cls_vector, text_cls = self.text_tower(input_ids, attention_mask)
         
         # 应用交叉注意力
-        cross_attention_output = self.cross_attention(image_second_vector, text_second_vector)
+        cross_attention_output = self.cross_attention(image_cls_vector, text_cls_vector)
         
         cross_attention_output = cross_attention_output.mean(dim=1)  # 平均池化
         
         # 使用 classifier 层生成分类预测
         classification_output = self.classifier(cross_attention_output)
         
-        return classification_output, image_first_vector, image_second_vector, image_cls, \
-               text_first_vector, text_second_vector, text_cls
+        return  classification_output, image_cls_vector, image_cls, \
+               text_cls_vector, text_cls

@@ -18,7 +18,7 @@ def main():
     vocab_size = 30522  # 根据实际数据集来设置
     
     model = DualTowerModel(vocab_size=vocab_size, output_dim=1024, n_head=8, num_classes=10).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
     num_epochs = 1
     save_path = "best_model.pth"

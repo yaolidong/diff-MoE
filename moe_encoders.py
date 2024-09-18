@@ -36,7 +36,7 @@ class SparseMoE(nn.Module):
 
 
 class ImageMoE(nn.Module):
-    def __init__(self, img_size=28, patch_size=4, embed_dim=128, output_dim=1024, num_experts=10, top_k=2):
+    def __init__(self, img_size=28, patch_size=4, embed_dim=1024, num_experts=10, top_k=2):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
@@ -51,13 +51,15 @@ class ImageMoE(nn.Module):
         #TODO:手动设置batch_size,[128,49,128]
         self.positional_encoding = positional_encoding(128, self.num_patches, embed_dim)
         self.sa = mHselfAttention.MultiHeadAttention(seq_len=self.num_patches, n_embd=embed_dim, n_head=8, head_size=self.head_size, dropout=0.1)
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches + 1, embed_dim))
+        self.dropout = nn.Dropout(0.1)
         self.ln1 = nn.LayerNorm(embed_dim)
-        self.proj = nn.Linear(embed_dim, output_dim)
-        self.ln2 = nn.LayerNorm(output_dim)
-        self.ln3 = nn.LayerNorm(output_dim)
-        self.first_moe = SparseMoE(output_dim, top_k, num_experts)
-        self.second_moe = SparseMoE(output_dim, top_k, num_experts)
-        self.cls = nn.Linear(output_dim, 10)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.ln3 = nn.LayerNorm(embed_dim)
+        self.first_moe = SparseMoE(embed_dim, top_k, num_experts)
+        self.second_moe = SparseMoE(embed_dim, top_k, num_experts)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.classification = nn.Linear(embed_dim, 10)
     
     def forward(self, x):
         b, c, h, w = x.shape
@@ -69,41 +71,50 @@ class ImageMoE(nn.Module):
 
         # 应用patch嵌入
         x = self.patch_embeddings(x)
-        
-        # 添加位置编码
-        x = x + self.positional_encoding.to(x.device)
         x = x + self.sa(self.ln1(x))
-        x = self.proj(x)
-        first_output = self.first_moe(self.ln2(x)).mean(dim=1)
-        second_output = self.second_moe(self.ln3(x)).mean(dim=1)
+        cls_token = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        # 添加位置编码
+        x = x + self.pos_embedding.to(x.device)
+        x = self.dropout(x)
+        first_output = self.first_moe(self.ln2(x))
+        second_output = self.second_moe(self.ln3(x))
         # 生成CLS向量
-        cls_vector = self.cls(second_output)
+        cls_vector = second_output[:, 0, :]
+        cls = self.classification(cls_vector)
 
-        return first_output, second_output, cls_vector
+        return first_output, second_output, cls_vector, cls
 
 class TextMoE(nn.Module):
-    def __init__(self, vocab_size, seq_length=16, embed_dim=128, output_dim=1024, num_experts=10, top_k=2):
+    def __init__(self, vocab_size, seq_length=16, embed_dim=1024, num_experts=10, top_k=2):
         super().__init__()
         self.head_size = embed_dim//8
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.positional_encoding = positional_encoding(128, seq_length, embed_dim)
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_length + 1, embed_dim))
         self.sa = mHselfAttention.MultiHeadAttention(seq_len=seq_length, n_embd=embed_dim, n_head=8, head_size=self.head_size, dropout=0.1)
         self.ln1 = nn.LayerNorm(embed_dim)
-        self.proj = nn.Linear(embed_dim, output_dim)
-        self.ln2 = nn.LayerNorm(output_dim)
-        self.ln3 = nn.LayerNorm(output_dim)
-        self.first_moe = SparseMoE(output_dim, top_k, num_experts)
-        self.second_moe = SparseMoE(output_dim, top_k, num_experts)
-        self.cls = nn.Linear(output_dim, 10)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.ln3 = nn.LayerNorm(embed_dim)
+        self.first_moe = SparseMoE(embed_dim, top_k, num_experts)
+        self.second_moe = SparseMoE(embed_dim, top_k, num_experts)
+        self.dropout = nn.Dropout(0.1)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.classification = nn.Linear(embed_dim, 10)
+
     def forward(self, input_ids, attention_mask):  
+        b = input_ids.shape[0]
         # 词嵌入[128,16,128]
         x = self.embedding(input_ids)
-        # 添加位置编码[128,16,128]
-        x = x + self.positional_encoding.to(x.device)
         x = x + self.sa(self.ln1(x))
-        x = self.proj(x)
-        first_output = self.first_moe(self.ln2(x)).mean(dim=1)
-        second_output = self.second_moe(self.ln3(x)).mean(dim=1)
+        cls_token = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        # 添加位置编码[128,16,128]
+        x = x + self.pos_embedding.to(x.device)
 
-        text_cls = self.cls(second_output)  
-        return first_output, second_output, text_cls
+        x = self.dropout(x)
+        first_output = self.first_moe(self.ln2(x))
+        second_output = self.second_moe(self.ln3(x))
+        cls_vector = second_output[:, 0, :]
+        cls = self.classification(cls_vector)
+        return first_output, second_output, cls_vector, cls
