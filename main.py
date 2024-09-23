@@ -1,49 +1,40 @@
 import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from model import DualTowerModel
-from data_loader import get_data_loaders
 from train import train
-from test import test, visualize_predictions
-import platform
+from test import test
+from dataset import CustomDataset  # 假设你有一个自定义的数据集类
+import argparse
 
 def main():
-    if platform.system() == 'Darwin':  # macOS
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    else:  # Windows or other
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    print(f"使用设备: {device}")
+    parser = argparse.ArgumentParser(description="Train and test DualTowerModel")
+    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--vocab_size', type=int, default=30522, help='Vocabulary size for text model')
+    parser.add_argument('--save_path', type=str, default='model.pth', help='Path to save the trained model')
+    args = parser.parse_args()
 
-    train_dataloader, test_dataloader = get_data_loaders()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    vocab_size = 30522  # 根据实际数据集来设置
-    
-    model = DualTowerModel(vocab_size=vocab_size, output_dim=1024, n_head=8, num_classes=10).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    # 初始化模型
+    model = DualTowerModel(vocab_size=args.vocab_size).to(device)
 
-    num_epochs = 1
-    save_path = "best_model.pth"
+    # 定义优化器
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    train(model, train_dataloader, optimizer, device, num_epochs, save_path)
+    # 加载数据集
+    train_dataset = CustomDataset(split='train')
+    test_dataset = CustomDataset(split='test')
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # 加载模型
-    checkpoint = torch.load(save_path, map_location=device)
-    if 'model_version' in checkpoint and checkpoint['model_version'] == '1.2':
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-    else:
-        state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) else checkpoint
-        model_dict = model.state_dict()
-        state_dict = {k: v for k, v in state_dict.items() if k in model_dict}
-        model_dict.update(state_dict)
-        model.load_state_dict(model_dict, strict=False)
-    
-    model.eval()
+    # 训练模型
+    train(model, train_loader, optimizer, device, args.epochs, args.save_path)
 
-    test_accuracy = test(model, test_dataloader, device)
-    print(f"测试准确率: {test_accuracy:.4f}")
-
-    visualize_predictions(model, test_dataloader, device)
+    # 测试模型
+    test(model, test_loader, device)
 
 if __name__ == "__main__":
     main()

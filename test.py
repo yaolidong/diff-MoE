@@ -22,8 +22,7 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            classification_output, image_cls_vector, image_cls, \
-               text_cls_vector, text_cls = model(images, input_ids, attention_mask)
+            classification_output, image_feature_vector, text_feature_vector = model(images, input_ids, attention_mask)
             _, preds = torch.max(classification_output, 1)
             
             all_preds.extend(preds.cpu().tolist())
@@ -32,7 +31,7 @@ def test(model, dataloader, device):
     accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
     
     print("\n预测结果:")
-    print_output_distribution(image_cls)
+    print_output_distribution(classification_output)
     for pred, label in zip(all_preds[:10], all_labels[:10]):  # 只打印前10个结果
         pred_text = label_to_text[pred]
         true_text = label_to_text[label]
@@ -49,8 +48,7 @@ def visualize_predictions(model, dataloader, device):
     attention_mask = attention_mask.to(device)
     
     with torch.no_grad():
-        classification_output, image_cls_vector, image_cls, \
-                text_cls_vector, text_cls = model(images, input_ids, attention_mask)
+        classification_output, image_feature_vector, text_feature_vector = model(images, input_ids, attention_mask)
         _, preds = torch.max(classification_output, 1)
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
@@ -76,5 +74,4 @@ def print_output_distribution(outputs):
     avg_probs = probs.mean(dim=0)
     for i, prob in enumerate(avg_probs):
         print(f"Class {i}: {prob.item():.4f}")
-
 
