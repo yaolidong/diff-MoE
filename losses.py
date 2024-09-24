@@ -1,43 +1,32 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.07, batch_size=64, n_views=1, device='cuda'):
-        super().__init__()
+    def __init__(self, temperature=0.07):
+        super(InfoNCELoss, self).__init__()
         self.temperature = temperature
-        self.batch_size = batch_size
-        self.n_views = n_views
-        self.device = device
-        self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, image_features, text_features):
-        image_features = F.normalize(image_features, dim=1)
-        text_features = F.normalize(text_features, dim=1)
-        batch_size = image_features.shape[0]
+    def forward(self, visual_features, textual_features, labels):
+        # Normalize features
+        visual_features = F.normalize(visual_features, dim=1)
+        textual_features = F.normalize(textual_features, dim=1)
 
-        # 构建标签
-        labels = torch.arange(batch_size, device=self.device)
-        labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+        # Compute similarity scores
+        similarity_matrix = torch.matmul(visual_features, textual_features.T)
 
-        # 计算相似度矩阵
-        similarity_matrix = torch.matmul(image_features, text_features.T)
+        # Apply temperature
+        similarity_matrix = similarity_matrix / self.temperature
 
-        # 去除对角线元素
-        mask = torch.eye(batch_size, dtype=torch.bool, device=self.device)
-        labels = labels[~mask].view(batch_size, -1)
-        similarity_matrix = similarity_matrix[~mask].view(batch_size, -1)
+        # Create labels
+        # labels = torch.arange(visual_features.size(0)).cuda()
 
-        # 选择正样本和负样本
-        positives = similarity_matrix[labels.bool()].view(batch_size, -1)
-        negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
+        # Calculate cross-entropy loss
+        loss_v2t = F.cross_entropy(similarity_matrix, labels)
+        loss_t2v = F.cross_entropy(similarity_matrix.T, labels)
 
-        # 拼接正负样本
-        logits = torch.cat([positives, negatives], dim=1)
-        labels = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-
-        # 计算损失
-        logits = logits / self.temperature
-        loss = self.criterion(logits, labels)
+        # Combine the two losses
+        loss = (loss_v2t + loss_t2v) / 2.0
 
         return loss
+

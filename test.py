@@ -22,8 +22,8 @@ def test(model, dataloader, device):
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
             
-            classification_output, image_feature_vector, text_feature_vector = model(images, input_ids, attention_mask)
-            _, preds = torch.max(classification_output, 1)
+            classification_output, image_feature_vector, text_feature_vector, image_cls, text_cls = model(images, input_ids, attention_mask)
+            _, preds = torch.max(image_cls, 1)
             
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
@@ -48,8 +48,8 @@ def visualize_predictions(model, dataloader, device):
     attention_mask = attention_mask.to(device)
     
     with torch.no_grad():
-        classification_output, image_feature_vector, text_feature_vector = model(images, input_ids, attention_mask)
-        _, preds = torch.max(classification_output, 1)
+        classification_output, image_feature_vector, text_feature_vector, image_cls, text_cls = model(images, input_ids, attention_mask)
+        _, preds = torch.max(image_cls, 1)
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     for i, ax in enumerate(axes.flat):
