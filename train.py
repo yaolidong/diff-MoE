@@ -5,8 +5,6 @@ from tqdm import tqdm  # 导入tqdm
 
 from losses import InfoNCELoss
 from cross_attention import CrossAttention
-torch.manual_seed(0)
-torch.cuda.manual_seed_all(0)
 
 def train(model, dataloader, optimizer, device, num_epochs, save_path):
     info_nce_loss = InfoNCELoss().to(device)

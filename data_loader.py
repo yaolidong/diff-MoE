@@ -1,35 +1,54 @@
 import torch
 from torch.utils.data import DataLoader
 import torchvision
+from torchvision import transforms
 from transformers import BertTokenizer
-from label_to_text import label_to_text
-from image_augmentation import get_augmentation
+from label_to_text import label_to_text, cifar10_label_to_text
 
 def get_data_loaders(batch_size=128):
-    augmentation = get_augmentation()
-    train_dataset = torchvision.datasets.FashionMNIST(root="./data", train=True, download=True, transform=None)
-    test_dataset = torchvision.datasets.FashionMNIST(root="./data", train=False, download=True, transform=None)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=lambda x: collate_fn(x, augmentation))
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=lambda x: collate_fn(x, augmentation))
-    return train_dataloader, test_dataloader
+    # Fashion-MNIST的转换
+    fashion_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
 
-def collate_fn(batch, augmentation):
+    # CIFAR-10的转换
+    cifar_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    # 加载Fashion-MNIST数据集
+    fashion_train = torchvision.datasets.FashionMNIST(root="./data", train=True, download=True, transform=fashion_transform)
+    fashion_test = torchvision.datasets.FashionMNIST(root="./data", train=False, download=True, transform=fashion_transform)
+
+    # 加载CIFAR-10数据集
+    cifar_train = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=cifar_transform)
+    cifar_test = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=cifar_transform)
+
+    # 创建数据加载器
+    fashion_train_loader = DataLoader(fashion_train, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=fashion_collate_fn)
+    fashion_test_loader = DataLoader(fashion_test, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=fashion_collate_fn)
+    
+    cifar_train_loader = DataLoader(cifar_train, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=cifar_collate_fn)
+    cifar_test_loader = DataLoader(cifar_test, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=cifar_collate_fn)
+    
+    return (fashion_train_loader, fashion_test_loader), (cifar_train_loader, cifar_test_loader)
+
+def fashion_collate_fn(batch):
+    return general_collate_fn(batch, label_to_text)
+
+def cifar_collate_fn(batch):
+    return general_collate_fn(batch, cifar10_label_to_text)
+
+def general_collate_fn(batch, label_dict):
     images, labels = zip(*batch)
     
-    # 原始图像
-    original_images = [augmentation(img) for img in images]
-    # print(f"原始图像维度: {[img.shape for img in original_images]}")
-    original_images = torch.stack(original_images)
-    
-    # 增强图像
-    augmented_images = [augmentation(img) for img in images]
-    # print(f"增强图像维度: {[img.shape for img in augmented_images]}")
-    augmented_images = torch.stack(augmented_images)
+    # 堆叠图像
+    images = torch.stack(images)
     
     labels = torch.tensor(labels)
-    # for label in labels:
-    #     print(label_to_text[label.item()])
-    texts = [label_to_text[label.item()] for label in labels]
+    texts = [label_dict[label.item()] for label in labels]
 
     tokenizer = BertTokenizer.from_pretrained("./bert-base-uncased")
     text_tensors = tokenizer(texts, padding='max_length', truncation=True, max_length=16, return_tensors="pt")
@@ -37,9 +56,4 @@ def collate_fn(batch, augmentation):
     input_ids = text_tensors['input_ids']
     attention_mask = text_tensors['attention_mask']
     
-    return original_images, input_ids, attention_mask, labels
-
-
-
-
-
+    return images, input_ids, attention_mask, labels

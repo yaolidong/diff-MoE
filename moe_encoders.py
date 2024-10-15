@@ -36,19 +36,17 @@ class SparseMoE(nn.Module):
 
 
 class ImageMoE(nn.Module):
-    def __init__(self, img_size=28, patch_size=4, embed_dim=1024, num_experts=10, top_k=2):
+    def __init__(self, img_size=32, patch_size=4, in_channels=3, embed_dim=1024, num_experts=10, top_k=2):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
-        # 7*7 = 49个patch
+        self.in_channels = in_channels
         self.num_patches = (img_size // patch_size) ** 2
-        # 16维的patch_dim
-        self.patch_dim = patch_size * patch_size
+        self.patch_dim = patch_size * patch_size * in_channels
         self.output_dim = embed_dim
-        self.head_size = embed_dim//8
-        # 将patch_dim = 16升维到embed_dim = 128,[128,49,128]
+        self.head_size = embed_dim // 8
+
         self.patch_embeddings = nn.Linear(self.patch_dim, embed_dim)
-        #TODO:手动设置batch_size,[128,49,128]
         self.positional_encoding = positional_encoding(128, self.num_patches, embed_dim)
         self.sa = mHselfAttention.MultiHeadAttention(seq_len=self.num_patches, n_embd=embed_dim, n_head=8, head_size=self.head_size, dropout=0.1)
         self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, embed_dim))
@@ -62,12 +60,20 @@ class ImageMoE(nn.Module):
     
     def forward(self, x):
         b, c, h, w = x.shape
+        
+        # 如果输入是单通道图像，将其扩展为三通道
+        if c == 1:
+            x = x.repeat(1, 3, 1, 1)
+            c = 3
+        
+        # 确保图像大小正确
+        if h != self.img_size or w != self.img_size:
+            x = nn.functional.interpolate(x, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
+        
         x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
         x = x.contiguous().view(b, c, -1, self.patch_size * self.patch_size)
         x = x.permute(0, 2, 1, 3).contiguous().view(b, -1, self.patch_dim)
         
-        #加入self-attention
-
         # 应用patch嵌入
         x = self.patch_embeddings(x)
         x = x + self.sa(self.ln1(x))
