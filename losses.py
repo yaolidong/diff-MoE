@@ -7,26 +7,33 @@ class InfoNCELoss(nn.Module):
         super(InfoNCELoss, self).__init__()
         self.temperature = temperature
 
-    def forward(self, visual_features, textual_features, labels):
-        # Normalize features
-        visual_features = F.normalize(visual_features, dim=1)
-        textual_features = F.normalize(textual_features, dim=1)
+    def forward(self, visual_features, textual_features):
 
-        # Compute similarity scores
-        similarity_matrix = torch.matmul(visual_features, textual_features.T)
+        # 创建标签矩阵[128,128]
+        labels = torch.cat([torch.arange(visual_features.shape[0]) for i in range(2)], dim=0)
+        labels = labels.unsqueeze(0) == labels.unsqueeze(1)
+        labels = labels.to(visual_features.device)
 
-        # Apply temperature
+        combined_features = torch.cat([visual_features, textual_features], dim=0)
+        # 归一化
+        combined_features = F.normalize(combined_features, dim=1)
+
+        # 计算相似度
+        similarity_matrix = torch.matmul(combined_features, combined_features.T)
         similarity_matrix = similarity_matrix / self.temperature
 
-        # Create labels
-        # labels = torch.arange(visual_features.size(0)).cuda()
+        # 创建掩码矩阵[128,128]
+        mask = torch.eye(labels.shape[0], dtype=torch.bool).to(similarity_matrix.device)
+        similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
+        labels = labels[~mask].view(labels.shape[0], -1)
 
-        # Calculate cross-entropy loss
-        loss_v2t = F.cross_entropy(similarity_matrix, labels)
-        loss_t2v = F.cross_entropy(similarity_matrix.T, labels)
+        positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
 
-        # Combine the two losses
-        loss = (loss_v2t + loss_t2v) / 2.0
+        negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
 
+        logits = torch.cat([positives, negatives], dim=1)
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(visual_features.device)
+
+        loss = F.cross_entropy(logits, labels)
         return loss
 

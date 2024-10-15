@@ -24,4 +24,4 @@ class DualTowerModel(nn.Module):
         # 使用 classifier 层生成分类预测
         classification_output = self.classifier(cross_attention_output)
         
-        return  classification_output, image_feature_vector, text_feature_vector, image_cls, text_cls
+        return image_feature_vector, text_feature_vector, image_cls, text_cls
