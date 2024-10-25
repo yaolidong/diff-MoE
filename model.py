@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from moe_encoders import ImageMoE, TextMoE  # 导入新的编码器
+from moe_encoders import ImageMoE, TextMoE 
 from cross_attention import CrossAttention
 
 

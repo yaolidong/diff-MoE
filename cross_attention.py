@@ -29,4 +29,7 @@ class CrossAttention(nn.Module):
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.head_dim)
         
+        # 压缩序列长度维度
+        out = out.mean(dim=1)  
+        
         return self.out(out)
