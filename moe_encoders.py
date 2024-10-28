@@ -112,32 +112,8 @@ class TextMoE(nn.Module):
         x = x + self.pos_embedding.to(x.device)
 
         x = self.dropout(x)
-        first_output = self.first_moe(self.ln2(x))
-        second_output = self.second_moe(self.ln3(x))
+        first_output, _, _ = self.first_moe(self.ln2(x))
+        second_output, _, _ = self.second_moe(self.ln3(x))
         feature_vector = second_output.mean(dim=1)  # 取平均值作为特征向量
         cls = self.classification(feature_vector)
         return first_output, second_output, feature_vector, cls
-
-def visualize_expert_preferences(model, image, save_path):
-    model.eval()
-    with torch.no_grad():
-        _, _, _, _, (first_expert_outputs, second_expert_outputs), (first_gating_output, second_gating_output) = model.image_tower(image.unsqueeze(0))
-
-    num_experts = model.image_tower.num_experts
-    fig, axes = plt.subplots(2, num_experts, figsize=(20, 8))
-
-    for layer, (expert_outputs, gating_output) in enumerate([(first_expert_outputs, first_gating_output), (second_expert_outputs, second_gating_output)]):
-        for i in range(num_experts):
-            expert_output = expert_outputs[i].squeeze().mean(dim=-1).view(8, 8).cpu().numpy()
-            gating_weights = gating_output.squeeze()[:, i].view(8, 8).cpu().numpy()
-
-            combined = expert_output * gating_weights
-            axes[layer, i].imshow(combined, cmap='viridis')
-            axes[layer, i].set_title(f"Layer {layer+1}, Expert {i+1}")
-            axes[layer, i].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-    print(f"专家偏好可视化已保存为 '{save_path}'")

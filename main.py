@@ -20,7 +20,7 @@ def main():
     set_seed(42)  # 您可以选择任何整数作为种子
 
     # 设置超参数
-    epochs = 1
+    epochs = 10
     batch_size = 64
     lr = 0.001
     vocab_size = 30522
