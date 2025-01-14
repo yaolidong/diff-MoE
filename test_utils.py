@@ -6,25 +6,138 @@ import numpy as np
 from sklearn.metrics import confusion_matrix
 import matplotlib
 import math
+import os
+from matplotlib.font_manager import FontProperties
+import logging
+import platform
 
-matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-matplotlib.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def setup_matplotlib_fonts():
+    """设置matplotlib的字体，支持中文显示"""
+    system = platform.system()
+    
+    # 根据操作系统选择默认字体
+    if system == 'Darwin':  # macOS
+        default_fonts = ['PingFang SC', 'Hiragino Sans GB', 'Arial Unicode MS']
+    elif system == 'Windows':
+        default_fonts = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS']
+    else:  # Linux或其他
+        default_fonts = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'Arial Unicode MS']
+    
+    # 添加额外的备选字体
+    fallback_fonts = ['DejaVu Sans', 'Liberation Sans']
+    all_fonts = default_fonts + fallback_fonts
+    
+    # 尝试设置字体
+    font_found = False
+    for font in all_fonts:
+        try:
+            font_prop = FontProperties(font)
+            if font_prop.get_name() != 'DejaVu Sans':  # 验证字体是否真实可用
+                plt.rcParams['font.family'] = font
+                logger.info(f"成功设置字体: {font}")
+                font_found = True
+                break
+        except Exception as e:
+            logger.debug(f"字体 {font} 加载失败: {str(e)}")
+            continue
+    
+    if not font_found:
+        logger.warning("未找到合适的中文字体，将使用系统默认字体")
+        
+    # 设置其他matplotlib参数
+    plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
+    plt.rcParams['figure.dpi'] = 300  # 提高默认DPI
+    plt.rcParams['savefig.dpi'] = 300  # 提高保存图片的DPI
+    plt.rcParams['figure.figsize'] = [10, 6]  # 设置默认图片大小
+    plt.rcParams['figure.autolayout'] = True  # 自动调整布局
+
+# 初始化字体设置
+setup_matplotlib_fonts()
+
+# 图像处理相关的常量
+IMAGE_CMAP = 'gray'  # 灰度图colormap
+HEATMAP_CMAP = 'viridis'  # 热力图colormap
+FIGURE_DPI = 300  # 图片DPI
 
 def normalize_image(img):
-    """归一化图像到[0,1]范围"""
+    """
+    归一化图像到[0,1]范围
+    
+    Args:
+        img: torch.Tensor或numpy.ndarray类型的图像数据
+        
+    Returns:
+        numpy.ndarray: 归一化后的图像数据
+        
+    Raises:
+        TypeError: 如果输入类型不是torch.Tensor或numpy.ndarray
+    """
+    if not isinstance(img, (torch.Tensor, np.ndarray)):
+        raise TypeError(f"输入图像类型必须是torch.Tensor或numpy.ndarray，而不是{type(img)}")
+        
     if torch.is_tensor(img):
-        img = img.cpu().numpy()
-    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-    return img
+        img = img.detach().cpu().numpy()
+    
+    img_min = img.min()
+    img_max = img.max()
+    
+    if img_max - img_min < 1e-8:
+        logger.warning("图像数值范围过小，可能导致归一化结果不准确")
+        return np.zeros_like(img)
+        
+    return (img - img_min) / (img_max - img_min)
 
-def save_figure(name):
-    """保存图像到文件"""
-    plt.savefig(f'visualization_{name}.png', bbox_inches='tight', dpi=300)
-    plt.close()
+def save_figure(name, create_dir=True):
+    """
+    保存图像到文件
+    
+    Args:
+        name: str, 图像文件名（不包含路径和扩展名）
+        create_dir: bool, 是否创建目录，默认为True
+        
+    Raises:
+        IOError: 如果保存失败
+    """
+    try:
+        if create_dir:
+            os.makedirs('visualizations', exist_ok=True)
+            
+        filepath = f'visualizations/visualization_{name}.png'
+        plt.savefig(filepath, bbox_inches='tight', dpi=FIGURE_DPI)
+        logger.info(f"图像已保存到: {filepath}")
+        
+    except Exception as e:
+        logger.error(f"保存图像失败: {str(e)}")
+        raise
+    finally:
+        plt.close()
 
 def calculate_accuracy(outputs, labels):
-    """计算分类准确率"""
+    """
+    计算分类准确率
+    
+    Args:
+        outputs: dict, 模型输出字典，必须包含'logits'键
+        labels: torch.Tensor, 真实标签
+        
+    Returns:
+        float: 分类准确率
+        
+    Raises:
+        KeyError: 如果outputs中没有'logits'键
+        ValueError: 如果输入维度不匹配
+    """
+    if 'logits' not in outputs:
+        raise KeyError("模型输出字典中必须包含'logits'键")
+        
     logits = outputs['logits']
+    if logits.size(0) != labels.size(0):
+        raise ValueError(f"logits和labels的批次大小不匹配: {logits.size(0)} vs {labels.size(0)}")
+        
     predictions = torch.argmax(logits, dim=1)
     return (predictions == labels).float().mean().item()
 
@@ -169,62 +282,83 @@ def visualize_predictions_grid(model, data, labels, device, class_names, num_sam
         save_figure('predictions_grid')
 
 def visualize_expert_regions(model, image, device, class_names):
-    """可视化每个专家处理的图像区域"""
-    model.eval()
-    with torch.no_grad():
-        if image.dim() == 3:
-            image = image.unsqueeze(0)
-        image = image.to(device)
+    """
+    可视化每个专家处理的图像区域
+    
+    Args:
+        model: torch.nn.Module, 模型实例
+        image: torch.Tensor, 输入图像
+        device: torch.device, 计算设备
+        class_names: list, 类别名称列表
         
-        outputs = model(image)
-        expert_activations = outputs.get('expert_outputs', None)
+    Raises:
+        ValueError: 如果输入参数无效
+        RuntimeError: 如果模型处理过程出错
+    """
+    if not isinstance(image, torch.Tensor):
+        raise ValueError("输入图像必须是torch.Tensor类型")
         
-        if expert_activations is None:
-            print("专家输出不可用")
-            return
+    if image.dim() not in [3, 4]:
+        raise ValueError(f"输入图像维度必须是3或4，当前是{image.dim()}")
+    
+    try:
+        model.eval()
+        with torch.no_grad():
+            # 处理输入图像
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+            image = image.to(device)
             
-        # 获取专家数量
-        num_experts = expert_activations.shape[0]
-        
-        # 计算行数和列数，确保有足够的空间显示所有专家
-        num_cols = min(4, num_experts + 1)  # +1 是为了原始图像
-        num_rows = (num_experts + num_cols) // num_cols  # 向上取整
-        
-        # 创建图像网格
-        fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 4, num_rows * 3))
-        if num_rows == 1:
-            axes = axes.reshape(1, -1)
-        axes = axes.flatten()
-        
-        # 显示原始图像
-        img = image[0].cpu()
-        if img.shape[0] == 3:
-            img = img.permute(1, 2, 0)
-        img = normalize_image(img)
-        axes[0].imshow(img)
-        axes[0].set_title('原始图像')
-        axes[0].axis('off')
-        
-        # 计算patch grid的大小
-        patch_grid_size = int(math.sqrt(expert_activations.shape[2]))  # 假设patches是正方形排列的
-        
-        # 显示每个专家的激活图
-        for i in range(num_experts):
-            activation = expert_activations[i, 0].cpu()  # 取第一个样本
-            # 将一维激活图重塑为二维图像
-            activation = activation.reshape(patch_grid_size, patch_grid_size)
-            activation = normalize_image(activation)
+            # 获取模型输出
+            outputs = model(image)
+            expert_activations = outputs.get('expert_outputs', None)
             
-            axes[i+1].imshow(activation, cmap='viridis')
-            axes[i+1].set_title(f'专家 {i} 的处理区域')
-            axes[i+1].axis('off')
+            if expert_activations is None:
+                logger.warning("专家输出不可用，可能是模型配置问题")
+                return
+                
+            # 获取专家数量和设置图像布局
+            num_experts = expert_activations.shape[0]
+            num_cols = min(4, num_experts + 1)
+            num_rows = (num_experts + num_cols) // num_cols
             
-        # 隐藏多余的子图
-        for i in range(num_experts + 1, len(axes)):
-            axes[i].axis('off')
+            # 创建图像网格
+            fig, axes = plt.subplots(num_rows, num_cols, 
+                                   figsize=(num_cols * 4, num_rows * 3),
+                                   squeeze=False)
+            axes = axes.flatten()
             
-        plt.tight_layout()
-        save_figure('expert_regions')
+            # 显示原始图像
+            img = image[0].squeeze().cpu()
+            plt.sca(axes[0])
+            plt.imshow(img, cmap=IMAGE_CMAP)
+            plt.title('原始图像')
+            plt.axis('off')
+            
+            # 计算patch grid的大小
+            patch_grid_size = int(math.sqrt(expert_activations.shape[2]))
+            
+            # 显示每个专家的激活图
+            for i in range(num_experts):
+                activation = expert_activations[i, 0].cpu()
+                activation = activation.reshape(patch_grid_size, patch_grid_size)
+                activation = normalize_image(activation)
+                
+                plt.sca(axes[i+1])
+                plt.imshow(activation, cmap=HEATMAP_CMAP)
+                plt.title(f'专家 {i} 的处理区域')
+                plt.axis('off')
+                
+            # 隐藏多余的子图
+            for i in range(num_experts + 1, len(axes)):
+                axes[i].axis('off')
+                
+            plt.tight_layout()
+            save_figure('expert_regions')
+            
+    except Exception as e:
+        logger.error(f"可视化专家区域时发生错误: {str(e)}")
+        raise RuntimeError(f"可视化失败: {str(e)}")
 
 def visualize_expert_tokens(model, data, labels, device, class_names):
     """可视化每个专家处理的样本token"""

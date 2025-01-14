@@ -16,13 +16,23 @@ import os
 
 def main():
     # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("使用设备: Apple M1/M2 GPU (MPS)")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("使用设备: NVIDIA GPU (CUDA)")
+    else:
+        device = torch.device("cpu")
+        print("使用设备: CPU")
 
     # 设置随机种子
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
+
+    # 确保model目录存在
+    os.makedirs('model', exist_ok=True)
 
     # 数据预处理
     transform = transforms.Compose([
@@ -83,15 +93,15 @@ def main():
             early_stopping_patience=5
         )
         # 保存模型
-        torch.save(model.state_dict(), 'model.pth')
-        print("模型已保存至 model.pth")
+        torch.save(model.state_dict(), 'model/model.pth')
+        print("模型已保存至 model/model.pth")
     else:
         print("\n加载已有模型...")
         try:
-            model.load_state_dict(torch.load('model.pth'))
+            model.load_state_dict(torch.load('model/model.pth'))
             print("模型加载成功")
         except FileNotFoundError:
-            print("未找到已保存的模型文件 model.pth，请先训练模型")
+            print("未找到已保存的模型文件 model/model.pth，请先训练模型")
             return
 
     # 选择测试模式
