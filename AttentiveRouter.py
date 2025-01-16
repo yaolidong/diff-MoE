@@ -1,69 +1,67 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict
 
 class AttentiveRouter(nn.Module):
-    def __init__(self, embed_dim, num_experts, top_k=2, expert_capacity_factor=1.25):
+    def __init__(self, hidden_size: int, top_k: int, num_experts: int):
         super().__init__()
-        
+        # 确保top_k不超过专家数量
+        self.top_k = min(top_k, num_experts)
         self.num_experts = num_experts
-        self.top_k = top_k
-        self.expert_capacity_factor = expert_capacity_factor
         
-        # 注意力机制用于路由决策
-        self.attention = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+        # 注意：如果top_k大于num_experts，发出警告
+        if top_k > num_experts:
+            print(f"警告: top_k ({top_k}) 大于专家数量 ({num_experts})，已自动调整为 {num_experts}")
+        
+        # 路由器网络
+        self.router = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
             nn.GELU(),
-            nn.Linear(embed_dim, num_experts)
+            nn.Linear(hidden_size * 2, num_experts)
         )
         
-        # 用于计算专家分配的温度参数
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        # 初始化参数
+        self._init_weights()
         
-        # 用于记录注意力权重
-        self.register_buffer('attention_weights', None, persistent=False)
+    def _init_weights(self):
+        for module in self.router.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # 计算专家权重
+        expert_weights = self.router(x)  # [batch_size, seq_len, num_experts]
         
-    def forward(self, x):
-        # 计算注意力分数
-        attention_scores = self.attention(x)  # [batch_size, seq_len, num_experts]
-        
-        # 应用温度缩放
-        attention_scores = attention_scores / self.temperature
-        
-        # 使用softmax获取专家分配概率
-        expert_weights = F.softmax(attention_scores, dim=-1)
-        
-        # 保存注意力权重用于可视化
-        self.attention_weights = expert_weights.detach()
-        
-        # 选择top-k个专家
+        # 获取top-k专家
         top_k_weights, top_k_indices = torch.topk(expert_weights, self.top_k, dim=-1)
         
-        # 重新归一化top-k权重
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        # 计算softmax
+        top_k_weights = F.softmax(top_k_weights, dim=-1)
         
-        # 创建专家mask
-        expert_mask = torch.zeros_like(expert_weights)
-        expert_mask.scatter_(-1, top_k_indices, top_k_weights)
+        # 创建mask
+        masks = torch.zeros_like(expert_weights).scatter_(-1, top_k_indices, top_k_weights)
         
-        # 计算路由损失（用于平衡专家使用）
-        # 1. 负载平衡损失
-        expert_usage = expert_mask.sum(dim=[0, 1])  # [num_experts]
-        ideal_usage = expert_mask.sum() / self.num_experts
-        load_balance_loss = torch.mean((expert_usage - ideal_usage).pow(2))
+        # 计算路由损失
+        # 1. 负载均衡损失
+        expert_usage = masks.sum(dim=[0, 1])  # [num_experts]
+        expert_usage = expert_usage / expert_usage.sum()  # 归一化
+        target_usage = torch.ones_like(expert_usage) / self.num_experts
+        load_balancing_loss = F.mse_loss(expert_usage, target_usage)
         
-        # 2. 专家容量损失
-        capacity = int(self.expert_capacity_factor * expert_mask.size(1))
-        expert_capacity_loss = torch.relu(expert_usage - capacity).mean()
+        # 2. 稀疏性损失
+        sparsity_loss = torch.mean(torch.sum(masks > 0, dim=-1).float()) / self.top_k
         
-        # 总路由损失
-        router_loss = load_balance_loss + expert_capacity_loss
+        # 总损失
+        total_loss = load_balancing_loss + 0.1 * sparsity_loss
         
         return {
-            'expert_masks': expert_mask,
-            'router_loss': router_loss,
-            'attention_weights': self.attention_weights,
-            'expert_indices': top_k_indices
+            'weights': expert_weights,
+            'masks': masks,
+            'loss': total_loss,
+            'expert_usage': expert_usage
         }
     
     def get_attention_weights(self):
