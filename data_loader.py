@@ -3,11 +3,17 @@ from torch.utils.data import DataLoader
 import torchvision
 from torchvision import transforms
 from transformers import BertTokenizer
-from label_to_text import fashion_mnist_label_to_text, cifar10_label_to_text
+from label_to_text import get_text_descriptions
 import os
 from typing import Tuple, Dict, Any
 from dataclasses import dataclass
 from torch.utils.data import Dataset
+from enum import Enum
+import logging
+from config import CIFAR10Config, FashionMNISTConfig
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 @dataclass
 class DatasetConfig:
@@ -36,59 +42,105 @@ class DatasetConfig:
             transforms.Normalize(normalize_mean, normalize_std)
         ])
 
+# 新增数据集类型枚举
+class DatasetType(Enum):
+    CIFAR10 = "cifar10"
+    FASHION_MNIST = "fashion_mnist"
+
 class DatasetManager:
-    """数据集管理类"""
+    """统一数据集管理类"""
     
-    DATASETS = {
-        'cifar10': DatasetConfig(
-            name='cifar10',
-            in_channels=3,
-            class_names=['airplane', 'automobile', 'bird', 'cat', 'deer', 
-                        'dog', 'frog', 'horse', 'ship', 'truck'],
-            dataset_class=torchvision.datasets.CIFAR10
-        ),
-        'fashion_mnist': DatasetConfig(
-            name='fashion_mnist',
-            in_channels=1,
-            class_names=['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
-                        'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot'],
-            dataset_class=torchvision.datasets.FashionMNIST
-        )
-    }
-    
-    @staticmethod
-    def get_model_paths(dataset_name: str) -> Dict[str, str]:
-        """获取模型相关路径"""
-        return {
-            'model': f'model/model_{dataset_name}.pth',
-            'best_model': f'model/best_model_{dataset_name}.pth',
-            'checkpoint': f'model/checkpoint_{dataset_name}.pth'
-        }
-    
-    def __init__(self, dataset_name: str, batch_size: int = 128, num_workers: int = None):
-        self.config = self.DATASETS.get(dataset_name)
-        if not self.config:
-            raise ValueError(f"不支持的数据集: {dataset_name}")
-            
+    def __init__(self, dataset_type: DatasetType, config: DatasetConfig, batch_size=128, num_workers=4):
+        self.dataset_type = dataset_type
+        self.config = config
         self.batch_size = batch_size
-        # 根据系统自动设置num_workers
-        if num_workers is None:
-            if torch.cuda.is_available():
-                self.num_workers = min(4, os.cpu_count())
-            else:
-                self.num_workers = 0  # 在CPU模式下不使用多进程
-        else:
-            self.num_workers = num_workers
-            
-        self.transform = self.config.get_transform()
+        self.num_workers = min(num_workers, os.cpu_count() or 4)
+        self._setup_transforms()
         
+    def _setup_transforms(self):
+        """根据配置初始化数据增强"""
+        # 确保配置中的image_size是有效的
+        if not hasattr(self.config, 'image_size') or not self.config.image_size:
+            image_size = (32, 32)
+        else:
+            image_size = self.config.image_size
+            
+        # 确保配置中的mean和std是有效的
+        if not hasattr(self.config, 'mean') or not self.config.mean:
+            if self.dataset_type == DatasetType.FASHION_MNIST:
+                mean = (0.2860,)
+                std = (0.3530,)
+            else:  # CIFAR10或默认值
+                # 使用更标准的归一化值以提高稳定性
+                mean = (0.4914, 0.4822, 0.4465)
+                std = (0.2023, 0.1994, 0.2010)  # 降低std值，减小数据范围，提高训练稳定性
+        else:
+            mean = self.config.mean
+            std = self.config.std
+            
+        # 基础数据转换
+        self.base_transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std)
+        ])
+        
+        # 增强的数据增强策略
+        if self.dataset_type == DatasetType.CIFAR10:
+            # CIFAR10的增强数据增强
+            self.train_transform = transforms.Compose([
+                transforms.RandomResizedCrop(size=image_size, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomApply([
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+                ], p=0.5),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
+                transforms.RandomRotation(15),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+                transforms.RandomErasing(p=0.2)
+            ])
+        elif self.dataset_type == DatasetType.FASHION_MNIST:
+            # Fashion-MNIST的增强数据增强
+            self.train_transform = transforms.Compose([
+                transforms.RandomResizedCrop(size=image_size, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(15),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+                transforms.RandomErasing(p=0.2)
+            ])
+        else:
+            # 默认数据增强
+            self.train_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(15),
+                self.base_transform
+            ])
+
     def get_datasets(self) -> Tuple[Dataset, Dataset]:
         """获取训练集和测试集"""
-        train_dataset = self.config.dataset_class(
-            root='./data', train=True, download=True, transform=self.transform)
-        test_dataset = self.config.dataset_class(
-            root='./data', train=False, download=True, transform=self.transform)
+        # 根据数据集类型获取数据集类
+        if self.dataset_type == DatasetType.CIFAR10:
+            dataset_class = torchvision.datasets.CIFAR10
+        elif self.dataset_type == DatasetType.FASHION_MNIST:
+            dataset_class = torchvision.datasets.FashionMNIST
+        else:
+            raise ValueError(f"不支持的数据集类型: {self.dataset_type}")
+            
+        train_dataset = dataset_class(
+            root='./data', train=True, download=True, transform=self.train_transform)
+        test_dataset = dataset_class(
+            root='./data', train=False, download=True, transform=self.base_transform)
         return train_dataset, test_dataset
+        
+    def get_model_paths(self, dataset_name: str) -> Dict[str, str]:
+        """获取模型保存路径"""
+        return {
+            'checkpoint': f'./checkpoints/{dataset_name}_model.pth',
+            'best_model': f'./checkpoints/{dataset_name}_best_model.pth'
+        }
         
     def get_data_loaders(self) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
         """获取数据加载器和数据集信息"""
@@ -127,11 +179,39 @@ class DatasetManager:
         
         return train_loader, test_loader, dataset_info
 
-def get_dataset_and_loaders(dataset_choice: str = 'fashion_mnist', 
-                           batch_size: int = 128) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
-    """获取数据集和数据加载器的便捷函数"""
-    manager = DatasetManager(dataset_choice, batch_size)
-    return manager.get_data_loaders() 
+def get_dataset_and_loaders(dataset_name: str = 'cifar10', 
+                          batch_size: int = 128) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
+    """获取数据集和数据加载器的便捷函数
+    
+    Args:
+        dataset_name: 数据集名称，'cifar10'或'fashion_mnist'
+        batch_size: 批量大小
+        
+    Returns:
+        train_loader: 训练数据加载器
+        test_loader: 测试数据加载器
+        dataset_info: 数据集信息字典
+    """
+    # 根据数据集名称获取配置和数据集类型
+    if dataset_name.lower() == 'cifar10':
+        config = CIFAR10Config()
+        dataset_type = DatasetType.CIFAR10
+    elif dataset_name.lower() in ['fashion_mnist', 'fashion-mnist']:
+        config = FashionMNISTConfig()
+        dataset_type = DatasetType.FASHION_MNIST
+    else:
+        raise ValueError(f"不支持的数据集: {dataset_name}")
+    
+    # 使用DatasetManager管理数据集
+    manager = DatasetManager(dataset_type, config, batch_size=batch_size)
+    
+    # 获取数据加载器和数据集信息
+    train_loader, test_loader, dataset_info = manager.get_data_loaders()
+    
+    # 添加img_size信息到dataset_info中
+    dataset_info['img_size'] = config.image_size[0]
+    
+    return train_loader, test_loader, dataset_info
 
 def general_collate_fn(batch, dataset_name: str):
     """
@@ -148,16 +228,11 @@ def general_collate_fn(batch, dataset_name: str):
     images = torch.stack(images)
     labels = torch.tensor(labels)
     
-    # 根据数据集选择对应的标签转换函数
-    label_to_text_fn = {
-        'fashion_mnist': fashion_mnist_label_to_text,
-        'cifar10': cifar10_label_to_text
-    }.get(dataset_name)
+    # 获取文本描述
+    class_descriptions = get_text_descriptions(dataset_name)
     
-    if label_to_text_fn is None:
-        raise ValueError(f"不支持的数据集: {dataset_name}")
-    
-    texts = [label_to_text_fn(label.item()) for label in labels]
+    # 将标签转换为文本描述
+    texts = [class_descriptions[label.item()] for label in labels]
     
     try:
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", 

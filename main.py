@@ -1,297 +1,303 @@
-import torch
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
+# 在导入所有模块之前设置环境变量和日志级别
+import os
 import logging
+import warnings
+
+# 设置环境变量来控制NumExpr线程数
+os.environ["NUMEXPR_MAX_THREADS"] = "16"
+
+# 禁用不必要的日志和警告
+logging.getLogger("numexpr").setLevel(logging.WARNING)
+logging.getLogger("numexpr.utils").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("torchvision").setLevel(logging.WARNING)
+
+# 同时禁用其他可能的警告
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import torch
+import torch.nn as nn
 from model import MultiModalMoE
 from train import train
-from test_utils import *
+from test_utils import test_model
+from visualization import (
+    visualize_predictions_grid, visualize_expert_regions,
+    visualize_expert_tokens, visualize_router_decisions,
+    visualize_attention, plot_confusion_matrix
+)
+from config import TrainingConfig, DatasetConfig, ModelConfig
+import torch.optim as optim
+from transformers import get_cosine_schedule_with_warmup
 from data_loader import get_dataset_and_loaders
-from visualization import *
-import os
-from typing import Optional
-from dataclasses import dataclass
+
+# 禁用torch.compile错误，允许回退到eager模式
+try:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+except ImportError:
+    pass
 
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.WARNING,  # 提高日志级别到WARNING，减少INFO级别的输出
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('training.log')
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
     ]
 )
+# 只将主程序的日志级别设为INFO，其他模块保持WARNING级别
 logger = logging.getLogger(__name__)
-
-@dataclass
-class ModelConfig:
-    """模型配置类"""
-    img_size: int = 32
-    patch_size: int = 4
-    in_channels: int = 3
-    embed_dim: int = 512
-    num_shared_experts: int = 4
-    num_modality_specific_experts: int = 2
-    top_k: int = 2
-    num_heads: int = 8
-    num_layers: int = 6
-    num_classes: int = 10
-    dropout: float = 0.1
-    activation: str = 'gelu'
-    use_bias: bool = True
-    layer_norm_eps: float = 1e-5
-    initializer_range: float = 0.02
-
-class ModelManager:
-    """模型管理类"""
-    def __init__(self, config: ModelConfig, device: torch.device):
-        self.config = config
-        self.device = device
-        
-    def create_model(self, in_channels: int) -> MultiModalMoE:
-        """创建模型"""
-        # 更新配置中的输入通道数
-        self.config.in_channels = in_channels
-        
-        # 创建模型
-        model = MultiModalMoE(self.config).to(self.device)
-        return model
-        
-    def load_model(self, model: MultiModalMoE, model_paths: dict) -> Optional[MultiModalMoE]:
-        """加载模型"""
-        try:
-            if os.path.exists(model_paths['best_model']):
-                model.load_state_dict(torch.load(model_paths['best_model']))
-                logger.info(f"已加载最佳模型: {model_paths['best_model']}")
-            elif os.path.exists(model_paths['model']):
-                model.load_state_dict(torch.load(model_paths['model']))
-                logger.info(f"已加载模型: {model_paths['model']}")
-            elif os.path.exists(model_paths['checkpoint']):
-                checkpoint = torch.load(model_paths['checkpoint'])
-                model.load_state_dict(checkpoint['model_state_dict'])
-                logger.info(f"已加载检查点: {model_paths['checkpoint']}")
-                logger.info(f"检查点轮次: {checkpoint['epoch']}")
-            else:
-                logger.warning("未找到任何可用的模型文件，请先训练模型")
-                return None
-            return model
-        except Exception as e:
-            logger.error(f"加载模型时出错: {str(e)}")
-            return None
-
-def setup_device() -> torch.device:
-    """设置计算设备"""
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        # 设置CUDA设备
-        torch.cuda.set_device(0)
-        print(f"使用设备: NVIDIA GPU ({torch.cuda.get_device_name(0)})")
-        # 设置CUDA随机种子
-        torch.cuda.manual_seed(42)
-        torch.cuda.manual_seed_all(42)
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("使用设备: Apple M1/M2 GPU (MPS)")
-        # MPS设备不需要特殊设置
-    else:
-        device = torch.device("cpu")
-        print("使用设备: CPU")
-    
-    # 确保所有操作都是确定性的
-    torch.manual_seed(42)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    return device
+logger.setLevel(logging.INFO)
 
 def setup_environment():
     """设置环境"""
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f'使用设备: {device}')
+    
     # 设置随机种子
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
+        
+        # 性能优化设置
+        torch.backends.cudnn.benchmark = TrainingConfig.cudnn_benchmark
+        torch.backends.cudnn.deterministic = TrainingConfig.cudnn_deterministic
+        
+        # 尝试预先分配内存以减少碎片化
+        try:
+            # 清空缓存并预热
+            torch.cuda.empty_cache()
+            # 预热GPU - 有助于减少延迟
+            dummy = torch.ones(1).cuda()
+            del dummy
+            logger.info("GPU预热完成")
+        except Exception as e:
+            logger.warning(f"GPU预热失败: {e}")
     
-    # 确保必要的目录存在
-    os.makedirs('model', exist_ok=True)
-    os.makedirs('data', exist_ok=True)
-    os.makedirs('bert_cache', exist_ok=True)
-    
-    # 设置torch的线程数
-    torch.set_num_threads(4)  # 避免过度使用CPU线程
+    return device
 
-def visualize_results(model: MultiModalMoE, test_loader: DataLoader, 
-                    device: torch.device, class_names: list):
-    """可视化模型结果"""
-    # 获取一批数据
-    data, labels = next(iter(test_loader))
-    
-    # 绘制混淆矩阵
-    plot_confusion_matrix(test_results['predictions'], test_results['labels'], class_names)
-    
-    # 绘制专家使用率分布
-    plot_expert_usage(test_results['expert_usage'][0])
-    
-    # 可视化预测结果网格
-    logger.info("显示预测结果网格...")
-    visualize_predictions_grid(model, data, labels, device, class_names)
-    
-    # 可视化专家处理的图像区域
-    logger.info("显示专家处理的图像区域...")
-    visualize_expert_regions(model, data[0], device, class_names)
-    
-    # 可视化专家处理的token
-    logger.info("显示专家处理的token分布...")
-    visualize_expert_tokens(model, data, labels, device, class_names)
-    
-    # 可视化路由决策
-    logger.info("显示路由决策...")
-    visualize_router_decisions(model, data, device)
-    
-    # 可视化注意力权重
-    logger.info("显示注意力权重...")
-    visualize_attention(model, data, device)
-    
-def visualize_single_image(model: MultiModalMoE, test_loader: DataLoader,
-                         device: torch.device, class_names: list):
-    """可视化单张图像的预测结果"""
-    # 获取一张测试图像
-    data, label = next(iter(test_loader))
-    image = data[0]  # 取第一张图片
-    true_label = class_names[label[0].item()]
-    
-    # 进行预测
-    predictions = predict_single_image(model, image, device, class_names)
-    
-    # 打印预测结果
-    logger.info(f"\n真实类别: {true_label}")
-    print_prediction_results(predictions)
-    
-    # 可视化预测结果
-    visualize_prediction(image, predictions)
-    
-    # 可视化专家处理的图像区域
-    logger.info("显示专家处理的图像区域...")
-    visualize_expert_regions(model, image, device, class_names)
-    
-    # 可视化路由决策
-    logger.info("显示路由决策...")
-    visualize_router_decisions(model, image.unsqueeze(0), device, num_samples=1)
-    
-    logger.info("操作完成！")
-
-def main():
+def main(dataset_name='cifar10'):
+    """主函数"""
     try:
         # 设置环境
-        setup_environment()
-        device = setup_device()
+        device = setup_environment()
         
-        # 选择数据集
-        print("请选择要使用的数据集：")
-        print("1. CIFAR10")
-        print("2. FashionMNIST")
-        dataset_choice = input("请输入选项（1或2）：").strip()
-        if dataset_choice not in ["1", "2"]:
-            logger.error("无效的数据集选择")
-            return
+        # 获取数据集
+        train_loader, test_loader, dataset_info = get_dataset_and_loaders(dataset_name, 
+                                                                          TrainingConfig.batch_size)
         
-        dataset_name = 'cifar10' if dataset_choice == "1" else 'fashion_mnist'
-
-        # 获取数据加载器和数据集信息
-        try:
-            train_loader, test_loader, dataset_info = get_dataset_and_loaders(dataset_name)
-        except Exception as e:
-            logger.error(f"加载数据集时出错: {str(e)}")
-            return
+        # 提取数据集信息
+        in_channels = dataset_info['in_channels']
+        img_size = dataset_info.get('img_size', 32)  # 默认为32
+        num_classes = len(dataset_info['class_names'])
+        class_names = dataset_info['class_names']
         
-        # 创建模型配置
-        model_config = ModelConfig(
-            in_channels=dataset_info['in_channels'],
-            num_classes=len(dataset_info['class_names'])
-        )
+        logger.info(f"数据集: {dataset_name}, 图像通道数: {in_channels}, "
+                    f"图像大小: {img_size}, 类别数: {num_classes}")
         
         # 创建模型
-        model_manager = ModelManager(model_config, device)
-        model = model_manager.create_model(dataset_info['in_channels'])
-
-        # 选择模式
-        print("\n请选择操作模式：")
-        print("1. 训练新模型")
-        print("2. 加载已有模型")
-        mode_choice = input("请输入选项（1或2）：").strip()
-        if mode_choice not in ["1", "2"]:
-            logger.error("无效的操作模式选择")
-            return
-
-        if mode_choice == "1":
-            logger.info("\n开始训练...")
-            try:
-                # 训练模型
-                model = train(
-                    model=model,
-                    train_loader=train_loader,
-                    val_loader=test_loader,
-                    num_epochs=100,
-                    lr=1e-4,
-                    device=device,
-                    early_stopping_patience=10,
-                    warmup_epochs=5,
-                    weight_decay=0.01,
-                    gradient_clip_val=1.0,
-                    label_smoothing=0.1,
-                    checkpoint_path=dataset_info['model_paths']['checkpoint']
-                )
-                # 保存最终模型
-                torch.save(model.state_dict(), dataset_info['model_paths']['model'])
-                logger.info(f"模型已保存至 {dataset_info['model_paths']['model']}")
-            except Exception as e:
-                logger.error(f"训练模型时出错: {str(e)}")
-                return
-        else:
-            logger.info("\n加载已有模型...")
-            model = model_manager.load_model(model, dataset_info['model_paths'])
-            if model is None:
-                return
-
-        # 选择测试模式
-        print("\n请选择测试模式：")
-        print("1. 测试整个数据集")
-        print("2. 预测单张图像")
-        test_mode = input("请输入选项（1或2）：").strip()
-        if test_mode not in ["1", "2"]:
-            logger.error("无效的测试模式选择")
-            return
-
-        if test_mode == "1":
-            logger.info("\n开始测试整个数据集...")
-            try:
-                # 测试模型
-                test_results = test_model(model, test_loader, device)
-                
-                # 打印模型性能总结
-                print_model_summary(model, test_results, dataset_info['class_names'])
-                
-                # 可视化结果
-                visualize_results(model, test_loader, device, dataset_info['class_names'])
-            except Exception as e:
-                logger.error(f"测试模型时出错: {str(e)}")
-                return
-        else:
-            logger.info("\n预测单张图像...")
-            try:
-                visualize_single_image(model, test_loader, device, dataset_info['class_names'])
-            except Exception as e:
-                logger.error(f"预测单张图像时出错: {str(e)}")
-                return
-
-    except KeyboardInterrupt:
-        logger.info("\n程序被用户中断")
+        try:
+            model = MultiModalMoE(
+                img_size=img_size,
+                patch_size=4,  # 使用固定的patch大小
+                in_channels=in_channels,
+                num_classes=num_classes,
+                embed_dim=256,  # 减小嵌入维度
+                num_shared_experts=2,  # 减少共享专家数量
+                num_modality_specific_experts=1,  # 减少模态特定专家数量
+                top_k=1,  # 减少激活的专家数量
+                dropout=0.1,
+                num_heads=4,  # 减少注意力头的数量
+                num_layers=3,  # 减少层数
+                activation='gelu',
+                # 添加文本模态相关参数
+                vocab_size=1000,  # 词汇表大小
+                max_text_len=32,  # 最大文本长度
+                text_embed_dim=128  # 文本嵌入维度
+            ).to(device)
+            logger.info("模型创建成功")
+        except Exception as e:
+            logger.error(f"模型创建失败: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None, None, None
+        
+        # 完全禁用torch.compile以避免Triton相关错误
+        # 根据之前的错误，我们直接跳过编译步骤
+        logger.info("跳过torch.compile优化，直接使用未优化模型")
+        
+        logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+        
+        # 设置损失函数
+        criterion = nn.CrossEntropyLoss(label_smoothing=TrainingConfig.label_smoothing)
+        
+        # 设置优化器
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=TrainingConfig.learning_rate,
+            weight_decay=TrainingConfig.weight_decay,
+            betas=(0.9, 0.95),  # 调整beta参数，提高动量学习效果
+            eps=1e-8  # 增加数值稳定性
+        )
+        
+        # 设置学习率调度器
+        total_steps = len(train_loader) * TrainingConfig.num_epochs
+        warmup_steps = int(total_steps * TrainingConfig.warmup_ratio)
+        
+        # 使用OneCycleLR调度器代替余弦调度器，提供更好的学习率调整
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=TrainingConfig.learning_rate,
+            total_steps=total_steps,
+            pct_start=TrainingConfig.warmup_ratio,
+            anneal_strategy='cos',
+            div_factor=25.0,
+            final_div_factor=10000.0
+        )
+        
+        # 确保checkpoint目录存在
+        os.makedirs(TrainingConfig.checkpoint_dir, exist_ok=True)
+        
+        # 获取GPU显存信息
+        if torch.cuda.is_available():
+            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"显存使用: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+            logger.info(f"显存缓存: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+        
+        # 训练模型
+        try:
+            # 获取文本描述
+            from label_to_text import get_text_descriptions
+            class_descriptions = get_text_descriptions(dataset_name)
+            logger.info(f"已加载{len(class_descriptions)}个类别的文本描述")
+            
+            best_model, train_metrics = train(
+                model=model,
+                train_loader=train_loader,
+                val_loader=test_loader,
+                device=device,
+                save_path=os.path.join(TrainingConfig.checkpoint_dir, f"{dataset_name}_model.pth"),
+                num_epochs=TrainingConfig.num_epochs,
+                gradient_clip_val=TrainingConfig.gradient_clip_val,
+                early_stopping_patience=TrainingConfig.early_stopping_patience,
+                use_amp=False,  # 暂时禁用混合精度训练
+                grad_accum_steps=1,  # 减少梯度累积步数
+                criterion=criterion,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                class_descriptions=class_descriptions  # 传递文本描述
+            )
+            
+            if best_model is None:
+                logger.error("训练失败，无法获取最佳模型")
+                return None, None, None
+            
+            logger.info("训练成功完成")
+            
+        except Exception as e:
+            logger.error(f"训练过程中出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None, None, None
+        
+        # 测试最佳模型
+        try:
+            test_results = test_model(best_model, test_loader, device, class_names, class_descriptions)
+            logger.info("测试成功完成")
+        except Exception as e:
+            logger.error(f"测试过程中出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            test_results = None
+        
+        # 提取一些数据用于可视化
+        try:
+            # 只有在测试成功的情况下才尝试可视化
+            if test_results is not None:
+                batch_data = next(iter(test_loader))
+                if isinstance(batch_data, (tuple, list)) and len(batch_data) == 2:
+                    test_images, test_labels = batch_data
+                    test_images, test_labels = test_images[:10].to(device), test_labels[:10].to(device)
+                    
+                    # 执行各种可视化
+                    try:
+                        visualize_predictions_grid(best_model, test_images, test_labels, device, class_names)
+                        logger.info("预测网格可视化完成")
+                    except Exception as e:
+                        logger.warning(f"预测网格可视化失败: {str(e)}")
+                    
+                    try:
+                        visualize_expert_regions(best_model, test_images[0], device, class_names)
+                        logger.info("专家区域可视化完成")
+                    except Exception as e:
+                        logger.warning(f"专家区域可视化失败: {str(e)}")
+                    
+                    try:
+                        visualize_expert_tokens(best_model, test_images, test_labels, device, class_names)
+                        logger.info("专家令牌可视化完成")
+                    except Exception as e:
+                        logger.warning(f"专家令牌可视化失败: {str(e)}")
+                    
+                    try:
+                        visualize_router_decisions(best_model, test_images, device)
+                        logger.info("路由决策可视化完成")
+                    except Exception as e:
+                        logger.warning(f"路由决策可视化失败: {str(e)}")
+                    
+                    try:
+                        visualize_attention(best_model, test_images, device)
+                        logger.info("注意力权重可视化完成")
+                    except Exception as e:
+                        logger.warning(f"注意力权重可视化失败: {str(e)}")
+                    
+                    # 生成混淆矩阵
+                    try:
+                        all_preds = test_results['predictions']
+                        all_labels = test_results['labels']
+                        plot_confusion_matrix(all_preds, all_labels, class_names)
+                        logger.info("混淆矩阵生成完成")
+                    except Exception as e:
+                        logger.warning(f"混淆矩阵生成失败: {str(e)}")
+                else:
+                    logger.warning(f"无法执行可视化: 数据格式不正确")
+            else:
+                logger.warning("由于测试失败，跳过可视化步骤")
+        except Exception as e:
+            logger.error(f"可视化过程中出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        return best_model, train_metrics, test_results
+    
     except Exception as e:
-        logger.error(f"程序运行时出错: {str(e)}")
-    finally:
-        # 清理资源
-        plt.close('all')  # 关闭所有图形窗口
-        if 'model' in locals():
-            del model  # 释放模型
-        torch.cuda.empty_cache()  # 清理GPU缓存
+        import traceback
+        logger.error(f"训练过程中出错: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None, None, None
 
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    # 可以选择数据集
+    dataset_choices = ['cifar10', 'fashion-mnist']
+    print("\n请选择数据集:")
+    for i, dataset in enumerate(dataset_choices, 1):
+        print(f"{i}. {dataset}")
+    
+    while True:
+        try:
+            choice = input("\n请输入数字选择数据集 (1-2): ").strip()
+            choice_num = int(choice)
+            if 1 <= choice_num <= len(dataset_choices):
+                dataset_name = dataset_choices[choice_num - 1]
+                break
+            else:
+                print(f"请输入1到{len(dataset_choices)}之间的数字")
+        except ValueError:
+            print("请输入有效的数字")
+    
+    print(f"\n已选择数据集: {dataset_name}")
+    main(dataset_name) 

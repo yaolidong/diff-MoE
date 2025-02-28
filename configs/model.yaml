@@ -1,0 +1,11 @@
+activation: gelu
+dropout: 0.2
+embed_dim: 512
+initializer_range: 0.02
+layer_norm_eps: 1.0e-05
+num_heads: 8
+num_layers: 6
+num_modality_specific_experts: 2
+num_shared_experts: 4
+top_k: 2
+use_gradient_checkpointing: true

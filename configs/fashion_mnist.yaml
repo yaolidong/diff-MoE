@@ -1,0 +1,27 @@
+batch_size: 128
+class_names:
+- T-shirt/top
+- Trouser
+- Pullover
+- Dress
+- Coat
+- Sandal
+- Shirt
+- Sneaker
+- Bag
+- Ankle boot
+data_dir: data
+image_size: !!python/tuple
+- 28
+- 28
+in_channels: 1
+mean: !!python/tuple
+- 0.286
+name: FashionMNIST
+num_classes: 10
+num_workers: 4
+patch_size: 4
+persistent_workers: true
+pin_memory: true
+std: !!python/tuple
+- 0.353
