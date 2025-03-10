@@ -1,5 +1,92 @@
-*.pth
-/data/
+# Python
 __pycache__/
-*.json
-image.png
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+.env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# 数据集和缓存
+data/
+datasets/
+clip_cache/
+cached_*/
+*.cache
+*.pkl
+*.h5
+*.npy
+*.npz
+.cursor/
+
+# 模型检查点和日志
+checkpoints/
+runs/
+logs/
+*.log
+*.pt
+*.pth
+wandb/
+lightning_logs/
+
+# 可视化输出
+visualizations/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+*.swp
+
+# 项目特定
+__MACOSX/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
