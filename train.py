@@ -135,8 +135,10 @@ def train(model, train_loader, val_loader, device, save_path, num_epochs=10,
             train_loss = train_total_loss / len(train_loader)
             train_acc = 100. * train_correct / train_total
             
-            # 验证阶段
-            val_loss, val_acc = test.evaluate(model, val_loader, criterion, device)
+            # 验证
+            model.eval()
+            with torch.no_grad():
+                val_loss, val_acc = test.validate(model, val_loader, criterion, device)
             
             # 更新学习率
             if scheduler is not None:

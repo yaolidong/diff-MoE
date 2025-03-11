@@ -99,11 +99,45 @@ class PatchEmbed(nn.Module):
             embed_dim: 嵌入维度
         """
         super().__init__()
+        
+        # 检查输入参数的有效性
+        if not isinstance(img_size, (int, tuple)):
+            raise TypeError(f"img_size必须是int或tuple类型，但得到了{type(img_size)}")
+        if not isinstance(patch_size, (int, tuple)):
+            raise TypeError(f"patch_size必须是int或tuple类型，但得到了{type(patch_size)}")
+        if not isinstance(in_channels, int):
+            raise TypeError(f"in_channels必须是int类型，但得到了{type(in_channels)}")
+        if not isinstance(embed_dim, int):
+            raise TypeError(f"embed_dim必须是int类型，但得到了{type(embed_dim)}")
+            
+        # 转换为元组格式
         self.img_size = img_size if isinstance(img_size, tuple) else (img_size, img_size)
         self.patch_size = patch_size if isinstance(patch_size, tuple) else (patch_size, patch_size)
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        
+        # 检查参数值的有效性
+        if self.img_size[0] <= 0 or self.img_size[1] <= 0:
+            raise ValueError(f"图像尺寸必须大于0，但得到了{self.img_size}")
+        if self.patch_size[0] <= 0 or self.patch_size[1] <= 0:
+            raise ValueError(f"patch尺寸必须大于0，但得到了{self.patch_size}")
+        if self.in_channels <= 0:
+            raise ValueError(f"输入通道数必须大于0，但得到了{self.in_channels}")
+        if self.embed_dim <= 0:
+            raise ValueError(f"嵌入维度必须大于0，但得到了{self.embed_dim}")
+        
+        # 检查图像尺寸和patch尺寸是否合适
+        if self.img_size[0] % self.patch_size[0] != 0 or self.img_size[1] % self.patch_size[1] != 0:
+            print(f"警告: 图像尺寸 {self.img_size} 不能被patch尺寸 {self.patch_size} 整除")
+            # 调整图像尺寸为能被patch_size整除的最近值
+            new_h = (self.img_size[0] // self.patch_size[0]) * self.patch_size[0]
+            new_w = (self.img_size[1] // self.patch_size[1]) * self.patch_size[1]
+            print(f"将调整图像尺寸为: ({new_h}, {new_w})")
+            self.img_size = (new_h, new_w)
         
         # 计算总的patch数量（适应任意形状的图像）
-        self.num_patches = (self.img_size[0] // self.patch_size[0]) * (self.img_size[1] // self.patch_size[1])
+        self.grid_size = (self.img_size[0] // self.patch_size[0], self.img_size[1] // self.patch_size[1])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
         
         # 使用卷积实现patch嵌入
         self.proj = nn.Conv2d(
@@ -111,6 +145,22 @@ class PatchEmbed(nn.Module):
             kernel_size=self.patch_size, 
             stride=self.patch_size
         )
+        
+        # 初始化权重
+        nn.init.normal_(self.proj.weight, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+        
+        # 调试标志
+        self.debug_forward = False
+        
+        # 打印初始化信息
+        print(f"\n[PatchEmbed] 初始化完成:")
+        print(f"图像尺寸: {self.img_size}")
+        print(f"Patch尺寸: {self.patch_size}")
+        print(f"输入通道数: {self.in_channels}")
+        print(f"嵌入维度: {self.embed_dim}")
+        print(f"网格尺寸: {self.grid_size}")
+        print(f"Patch数量: {self.num_patches}")
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播
@@ -121,15 +171,56 @@ class PatchEmbed(nn.Module):
         Returns:
             patch嵌入向量，形状为 [batch_size, num_patches, embed_dim]
         """
+        # 检查输入数据的有效性
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"输入必须是torch.Tensor类型，但得到了{type(x)}")
+            
+        if x.dim() != 4:
+            raise ValueError(f"输入必须是4维张量 [batch_size, channels, height, width]，但形状是{x.shape}")
+            
+        if x.size(1) != self.in_channels:
+            raise ValueError(f"输入通道数必须是{self.in_channels}，但得到了{x.size(1)}")
+            
         B, C, H, W = x.shape
-        # 这里不做强制断言，允许输入不同大小的图像
-        # 让模型自适应处理不同尺寸的输入
+        
+        if self.debug_forward:
+            print(f"[PatchEmbed] 输入: 形状={x.shape}, 设备={x.device}")
+        
+        # 检查输入尺寸并调整大小
+        if H != self.img_size[0] or W != self.img_size[1]:
+            if self.debug_forward:
+                print(f"[PatchEmbed] 调整输入尺寸从 ({H}, {W}) 到 {self.img_size}")
+            x = F.interpolate(x, size=self.img_size, mode='bilinear', align_corners=False)
+            if self.debug_forward:
+                print(f"[PatchEmbed] 调整后的形状: {x.shape}")
         
         # 应用卷积进行分块和投影
         x = self.proj(x)  # [B, embed_dim, grid_h, grid_w]
         
+        if self.debug_forward:
+            print(f"\n投影后:")
+            print(f"形状: {x.shape}")
+            print(f"数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+            print(f"数据类型: {x.dtype}")
+            print(f"设备: {x.device}")
+        
+        # 检查输出尺寸
+        _, E, gH, gW = x.shape
+        if gH != self.grid_size[0] or gW != self.grid_size[1]:
+            raise ValueError(
+                f"输出网格尺寸 ({gH}, {gW}) 与预期网格尺寸 {self.grid_size} 不匹配"
+            )
+        
         # 重塑为序列
         x = x.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
+        
+        if self.debug_forward:
+            print(f"\n最终输出:")
+            print(f"形状: {x.shape}")
+            print(f"数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+            print(f"数据类型: {x.dtype}")
+            print(f"设备: {x.device}")
+            print(f"是否与预期patch数量匹配: {x.size(1) == self.num_patches}")
         
         return x
 
@@ -482,6 +573,13 @@ class UnifiedModalEncoder(nn.Module):
         """
         batch_size, seq_len, embed_dim = x.shape
         
+        # 调试信息
+        debug = hasattr(self, 'debug_forward') and self.debug_forward
+        if debug:
+            print(f"\n[Router Block] 输入:")
+            print(f"形状: {x.shape}")
+            print(f"数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+        
         # 路由决策 - 决定每个token应该送到哪些专家
         # [batch_size, seq_len, num_experts]
         router_outputs = self.router(x)
@@ -490,10 +588,38 @@ class UnifiedModalEncoder(nn.Module):
         router_logits = router_outputs['logits']  # [batch_size, seq_len, num_experts]
         router_probs = router_outputs['router_probs']  # [batch_size, seq_len, num_experts]
         
+        if debug:
+            print(f"\n路由决策:")
+            print(f"Logits形状: {router_logits.shape}")
+            print(f"Logits范围: [{router_logits.min().item():.4f}, {router_logits.max().item():.4f}]")
+            print(f"概率形状: {router_probs.shape}")
+            print(f"概率范围: [{router_probs.min().item():.4f}, {router_probs.max().item():.4f}]")
+        
         # 获取最终的专家分配和组合权重
         # 每个token会被分配到top_k个专家
         expert_weights = router_outputs['expert_weights']  # [batch_size, seq_len, top_k]
         expert_indices = router_outputs['expert_indices']  # [batch_size, seq_len, top_k]
+        
+        if debug:
+            print(f"\n专家分配:")
+            print(f"权重形状: {expert_weights.shape}")
+            print(f"权重范围: [{expert_weights.min().item():.4f}, {expert_weights.max().item():.4f}]")
+            print(f"索引形状: {expert_indices.shape}")
+            print(f"索引范围: [{expert_indices.min().item()}, {expert_indices.max().item()}]")
+            print(f"专家使用统计:")
+            expert_counts = torch.zeros(len(self.shared_experts) + len(self.modality_specific_experts), 
+                                     device=expert_indices.device)
+            for i in range(expert_indices.size(-1)):
+                unique_experts, counts = torch.unique(expert_indices[:, :, i], return_counts=True)
+                for expert_idx, count in zip(unique_experts.tolist(), counts.tolist()):
+                    expert_counts[expert_idx] += count
+            total_tokens = batch_size * seq_len * self.top_k
+            for i, count in enumerate(expert_counts.tolist()):
+                usage_percent = count * 100 / total_tokens
+                if i < len(self.shared_experts):
+                    print(f"  共享专家 {i}: {usage_percent:.2f}% ({count}/{total_tokens})")
+                else:
+                    print(f"  特定专家 {i - len(self.shared_experts)}: {usage_percent:.2f}% ({count}/{total_tokens})")
         
         # 初始化输出tensor
         final_output = torch.zeros_like(x)  # [batch_size, seq_len, embed_dim]
@@ -511,6 +637,8 @@ class UnifiedModalEncoder(nn.Module):
             # 找出被路由到当前专家的所有token
             expert_mask = (expert_indices == i)  # [batch_size, seq_len, top_k]
             if not expert_mask.any():
+                if debug:
+                    print(f"共享专家 {i} 未被使用")
                 continue
                 
             # 展平mask
@@ -520,14 +648,26 @@ class UnifiedModalEncoder(nn.Module):
             token_mask = flat_mask.any(dim=-1)  # [batch_size * seq_len]
             
             if not token_mask.any():
+                if debug:
+                    print(f"共享专家 {i} 没有有效的token")
                 continue
                 
             # 选择这些token
             selected_tokens = token_indices[token_mask]  # [num_selected]
             selected_inputs = flat_x[selected_tokens]  # [num_selected, embed_dim]
             
+            if debug:
+                print(f"\n处理共享专家 {i}:")
+                print(f"选中的token数量: {len(selected_tokens)}")
+                print(f"输入形状: {selected_inputs.shape}")
+                print(f"输入范围: [{selected_inputs.min().item():.4f}, {selected_inputs.max().item():.4f}]")
+            
             # 应用专家
-            expert_output = expert(selected_inputs)  # [num_selected, embed_dim]
+            expert_output = expert(selected_inputs)
+            
+            if debug:
+                print(f"专家输出形状: {expert_output.shape}")
+                print(f"输出范围: [{expert_output.min().item():.4f}, {expert_output.max().item():.4f}]")
             
             # 收集每个被路由到当前专家的token对（token_idx, expert_idx）
             # 并计算其组合权重
@@ -552,6 +692,11 @@ class UnifiedModalEncoder(nn.Module):
                 
                 # 加权求和
                 final_output.reshape(-1, embed_dim)[k_tokens] += k_weights.unsqueeze(-1) * expert_output[k_indices_in_selected]
+                
+                if debug:
+                    print(f"  位置 {k}:")
+                    print(f"  - 选中的token数量: {len(k_tokens)}")
+                    print(f"  - 权重范围: [{k_weights.min().item():.4f}, {k_weights.max().item():.4f}]")
         
         # 处理模态特定专家
         modality_specific_outputs = []
@@ -562,6 +707,8 @@ class UnifiedModalEncoder(nn.Module):
             # 找出被路由到当前专家的所有token
             expert_mask = (expert_indices == expert_idx)  # [batch_size, seq_len, top_k]
             if not expert_mask.any():
+                if debug:
+                    print(f"特定专家 {i} 未被使用")
                 continue
                 
             # 展平mask
@@ -571,14 +718,26 @@ class UnifiedModalEncoder(nn.Module):
             token_mask = flat_mask.any(dim=-1)  # [batch_size * seq_len]
             
             if not token_mask.any():
+                if debug:
+                    print(f"特定专家 {i} 没有有效的token")
                 continue
                 
             # 选择这些token
             selected_tokens = token_indices[token_mask]  # [num_selected]
             selected_inputs = flat_x[selected_tokens]  # [num_selected, embed_dim]
             
+            if debug:
+                print(f"\n处理特定专家 {i}:")
+                print(f"选中的token数量: {len(selected_tokens)}")
+                print(f"输入形状: {selected_inputs.shape}")
+                print(f"输入范围: [{selected_inputs.min().item():.4f}, {selected_inputs.max().item():.4f}]")
+            
             # 应用专家
-            expert_output = expert(selected_inputs)  # [num_selected, embed_dim]
+            expert_output = expert(selected_inputs)
+            
+            if debug:
+                print(f"专家输出形状: {expert_output.shape}")
+                print(f"输出范围: [{expert_output.min().item():.4f}, {expert_output.max().item():.4f}]")
             
             # 收集每个被路由到当前专家的token对（token_idx, expert_idx）
             # 并计算其组合权重
@@ -603,6 +762,16 @@ class UnifiedModalEncoder(nn.Module):
                 
                 # 加权求和
                 final_output.reshape(-1, embed_dim)[k_tokens] += k_weights.unsqueeze(-1) * expert_output[k_indices_in_selected]
+                
+                if debug:
+                    print(f"  位置 {k}:")
+                    print(f"  - 选中的token数量: {len(k_tokens)}")
+                    print(f"  - 权重范围: [{k_weights.min().item():.4f}, {k_weights.max().item():.4f}]")
+        
+        if debug:
+            print(f"\n最终输出:")
+            print(f"形状: {final_output.shape}")
+            print(f"数据范围: [{final_output.min().item():.4f}, {final_output.max().item():.4f}]")
         
         return final_output, router_logits, router_probs
 
@@ -693,12 +862,12 @@ class MultiModalMoE(nn.Module):
     """多模态混合专家模型"""
     def __init__(
         self,
-        img_size: int,
-        patch_size: int,
-        in_channels: int,
-        num_classes: int,
+        img_size: int,          # 需要从dataset_info获取
+        patch_size: int,        # 需要从dataset_info获取
+        in_channels: int,       # 已从dataset_info获取
+        num_classes: int,       # 已从dataset_info获取
         embed_dim: int = 512,
-        num_shared_experts: int = 4,
+        num_shared_experts: int = 8,
         num_modality_specific_experts: int = 2,
         top_k: int = 2,
         dropout: float = 0.1,
@@ -710,7 +879,13 @@ class MultiModalMoE(nn.Module):
         use_gradient_checkpointing: bool = False,
         vocab_size: int = 1000,
         max_text_len: int = 32,
-        text_embed_dim: int = 128
+        text_embed_dim: int = 128,
+        text_descriptions: List[str] = None,
+        expert_type: str = 'resnet',
+        moe_layer: str = 'parallel',
+        use_gating: bool = True,
+        use_attention: bool = True,
+        device: str = 'cuda'
     ):
         """初始化多模态MoE模型
         
@@ -733,6 +908,12 @@ class MultiModalMoE(nn.Module):
             vocab_size: 词汇表大小
             max_text_len: 最大文本长度
             text_embed_dim: 文本嵌入维度
+            text_descriptions: 文本描述列表
+            expert_type: 专家类型
+            moe_layer: MoE层类型
+            use_gating: 是否使用门控
+            use_attention: 是否使用注意力
+            device: 设备
         """
         super().__init__()
         
@@ -789,7 +970,8 @@ class MultiModalMoE(nn.Module):
         max_pos_len = max(max_text_len, 77)  # CLIP默认使用77，确保能处理较长的序列
         self.text_pos_embed = nn.Parameter(torch.zeros(1, max_pos_len, embed_dim))
         
-        # 创建编码器层
+        # 在初始化各组件后添加进度提示
+        print("\n[模型初始化] 开始创建编码器层...")
         self.layers = nn.ModuleList([
             UnifiedModalEncoder(
                 embed_dim=embed_dim,
@@ -804,16 +986,14 @@ class MultiModalMoE(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        
-        # 设置编码器层的parent_model属性，以便它们能访问当前模型的属性
-        for layer in self.layers:
-            layer.parent_model = self
+        print("[模型初始化] 编码器层创建完成")
         
         # 最终的Layer Norm
         self.norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         
-        # 分类头
+        print("初始化分类头...")
         self.classifier = nn.Linear(embed_dim, num_classes)
+        print("[模型初始化] 全部组件初始化完成")
         
         # 路由损失系数
         self.router_z_loss = 0.001  # 抑制激活量
@@ -829,6 +1009,16 @@ class MultiModalMoE(nn.Module):
         # 初始化当前批次的标签
         self.current_labels = None
         self.debug_forward = False  # 前向传播调试标志
+        
+        # 添加文本描述处理
+        self.text_descriptions = text_descriptions
+        self.device = device
+        
+        # 添加新参数到配置
+        self.expert_type = expert_type
+        self.moe_layer = moe_layer
+        self.use_gating = use_gating
+        self.use_attention = use_attention
         
     def _init_weights(self, module):
         """初始化模型权重"""
@@ -863,7 +1053,6 @@ class MultiModalMoE(nn.Module):
         orig_size = int(math.sqrt(orig_seq_len))
         # 计算新图像的patch数量的平方根
         new_size = int(math.sqrt(seq_len))
-        
         if orig_size == new_size:
             return pos_embed
             
@@ -879,181 +1068,204 @@ class MultiModalMoE(nn.Module):
         return pos_embed
         
     def forward(self, x: torch.Tensor, text_tokens=None, attention_mask=None, return_attention: bool = False) -> Dict[str, torch.Tensor]:
-        # 获取设备信息
+        """前向传播
+        
+        Args:
+            x: 输入图像张量，形状为 [batch_size, in_channels, height, width]
+            text_tokens: 可选的文本token，形状为 [batch_size, seq_len]
+            attention_mask: 可选的注意力mask，形状为 [batch_size, seq_len]
+            return_attention: 是否返回注意力权重
+            
+        Returns:
+            包含logits, embeddings和其他信息的字典
+        """
         device = x.device
-        batch_size = x.shape[0]
+        fusion_outputs = {}  # 存储每一层的输出
         
-        # 确保所有组件都在同一个设备上
-        if not hasattr(self, '_device_checked'):
-            self._device_checked = True
-            self.to(device)
-            print(f"模型已移动到设备: {device}")
-        
-        # 保存当前batch的标签，如果是训练模式并且在之前设置过标签
-        if hasattr(self, 'current_labels') and self.current_labels is not None:
-            # 确保标签在正确的设备上
-            if self.current_labels.device != device:
-                self.current_labels = self.current_labels.to(device)
+        try:
+            # 检查输入数据的有效性
+            if not isinstance(x, torch.Tensor):
+                raise TypeError(f"输入x必须是torch.Tensor类型，但得到了{type(x)}")
             
-            # 确保标签的批次大小与当前图像批次大小一致
-            if len(self.current_labels) != batch_size:
-                print(f"警告: 当前标签的批次大小({len(self.current_labels)})与图像批次大小({batch_size})不一致")
-                if len(self.current_labels) > batch_size:
-                    self.current_labels = self.current_labels[:batch_size]
-                else:
-                    padding = torch.zeros(batch_size - len(self.current_labels), 
-                                       dtype=self.current_labels.dtype, 
-                                       device=device)
-                    self.current_labels = torch.cat([self.current_labels, padding])
+            if x.dim() != 4:
+                raise ValueError(f"输入x必须是4维张量 [batch_size, channels, height, width]，但形状是{x.shape}")
             
-            # 确保标签值在有效范围内
-            if self.current_labels.max() >= self.config['num_classes']:
-                print(f"警告: 标签值超出有效范围 [0-{self.config['num_classes']-1}]")
-                self.current_labels = torch.clamp(self.current_labels, 0, self.config['num_classes']-1)
-        
-        # 记录初始图像尺寸
-        if hasattr(self, 'debug_forward') and self.debug_forward:
-            print(f"输入图像形状: {x.shape}")
-            if hasattr(self, 'current_labels') and self.current_labels is not None:
-                print(f"当前标签形状: {self.current_labels.shape}, 设备: {self.current_labels.device}")
-                print(f"标签值范围: [{self.current_labels.min().item()}-{self.current_labels.max().item()}]")
-        
-        # 图像嵌入
-        x = self.patch_embed(x)
-        
-        # 应用位置编码
-        if x.size(1) != self.pos_embed.size(1):
-            pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
-        else:
-            pos_embed = self.pos_embed
-        
-        # 确保位置编码在正确的设备上
-        pos_embed = pos_embed.to(device)
-        
-        # 加上位置编码
-        x = x + pos_embed
-        
-        # 添加类型编码（图像token为0）
-        token_type_ids = torch.zeros(x.size(0), x.size(1), dtype=torch.long, device=device)
-        x = x + self.token_type_embed(token_type_ids)
-        
-        # 应用dropout
-        x = self.dropout(x)
-        
-        # 处理文本输入
-        modal_context = None
-        if text_tokens is not None:
-            try:
-                # 确保文本数据在正确的设备上
+            if x.size(1) != self.config['in_channels']:
+                raise ValueError(f"输入通道数必须是{self.config['in_channels']}，但得到了{x.size(1)}")
+            
+            if hasattr(self, 'debug_forward') and self.debug_forward:
+                # 简化调试输出，只打印关键信息
+                print(f"[MultiModalMoE Forward] 输入图像: 形状={x.shape}, 设备={x.device}")
+                if text_tokens is not None:
+                    print(f"文本输入: 形状={text_tokens.shape}, 设备={text_tokens.device}")
+            
+            # 设置patch_embed的调试标志 - 注释掉以避免级联调试输出
+            # if hasattr(self, 'patch_embed'):
+            #     self.patch_embed.debug_forward = self.debug_forward
+            
+            # 图像嵌入
+            x = self.patch_embed(x)
+            if hasattr(self, 'debug_forward') and self.debug_forward:
+                print(f"Patch嵌入后: 形状={x.shape}")
+            
+            # 应用位置编码
+            if x.size(1) != self.pos_embed.size(1):
+                if hasattr(self, 'debug_forward') and self.debug_forward:
+                    print(f"需要插值位置编码: 序列长度={x.size(1)}, 位置编码长度={self.pos_embed.size(1)}")
+                pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
+            else:
+                pos_embed = self.pos_embed
+            
+            # 确保位置编码在正确的设备上
+            pos_embed = pos_embed.to(device)
+            
+            # 加上位置编码
+            x = x + pos_embed
+            if hasattr(self, 'debug_forward') and self.debug_forward:
+                print(f"添加位置编码后: 形状={x.shape}")
+            
+            # 添加类型编码（图像token为0）
+            token_type_ids = torch.zeros(x.size(0), x.size(1), dtype=torch.long, device=device)
+            x = x + self.token_type_embed(token_type_ids)
+            
+            # 应用dropout
+            x = self.dropout(x)
+            
+            # 处理文本输入
+            modal_context = None
+            if text_tokens is not None:
+                if hasattr(self, 'debug_forward') and self.debug_forward:
+                    print(f"处理文本输入: 形状={text_tokens.shape}")
+                
+                # 确保文本输入在正确的设备上
                 text_tokens = text_tokens.to(device)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
-                else:
-                    attention_mask = torch.ones_like(text_tokens, device=device)
                 
                 # 文本嵌入
-                text_embeds = self.text_embedding(text_tokens)
-                text_features = self.text_projection(text_embeds)
+                text_features = self.text_embedding(text_tokens)  # [batch_size, seq_len, text_embed_dim]
+                text_features = self.text_projection(text_features)  # [batch_size, seq_len, embed_dim]
                 
-                # 检查文本特征的批次大小
-                text_batch_size = text_features.shape[0]
+                # 添加文本位置编码
+                text_pos_embed = self.text_pos_embed[:, :text_features.size(1), :].to(device)
+                text_features = text_features + text_pos_embed
                 
-                if text_batch_size != batch_size:
-                    if (hasattr(self, 'current_labels') and self.current_labels is not None 
-                            and text_batch_size == self.config['num_classes']):
-                        # 使用当前标签选择对应的文本特征
-                        valid_labels = torch.clamp(self.current_labels, 0, text_batch_size-1).long()
-                        text_features = text_features[valid_labels]
-                        attention_mask = attention_mask[valid_labels]
-                    else:
-                        raise ValueError(f"文本特征批次大小({text_batch_size})与图像批次大小({batch_size})不匹配")
-                
-                # 应用文本位置编码
-                text_seq_len = text_features.size(1)
-                if text_seq_len != self.text_pos_embed.size(1):
-                    if text_seq_len < self.text_pos_embed.size(1):
-                        text_pos_embed = self.text_pos_embed[:, :text_seq_len, :]
-                    else:
-                        last_pos = self.text_pos_embed[:, -1:, :]
-                        extra_pos = last_pos.repeat(1, text_seq_len - self.text_pos_embed.size(1), 1)
-                        text_pos_embed = torch.cat([self.text_pos_embed, extra_pos], dim=1)
-                else:
-                    text_pos_embed = self.text_pos_embed
-                
-                # 确保文本位置编码在正确的设备上
-                text_pos_embed = text_pos_embed.to(device)
-                text_features = text_features + text_pos_embed[:, :text_features.size(1), :]
-                
-                # 添加文本类型编码（文本token为1）
-                text_type_ids = torch.ones(text_features.size(0), text_features.size(1), 
-                                         dtype=torch.long, device=device)
+                # 添加类型编码（文本token为1）
+                text_type_ids = torch.ones(text_features.size(0), text_features.size(1), dtype=torch.long, device=device)
                 text_features = text_features + self.token_type_embed(text_type_ids)
                 
                 # 应用dropout
                 text_features = self.dropout(text_features)
-                modal_context = text_features
                 
-            except Exception as e:
-                print(f"处理文本特征时出错: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                modal_context = None
-        
-        # 初始化融合层输出字典
-        fusion_outputs = {}
-        
-        # 遍历编码器层
-        for layer_idx, layer in enumerate(self.layers):
-            # 确保层知道当前的标签
-            if hasattr(self, 'current_labels'):
-                layer.current_labels = self.current_labels
+                if hasattr(self, 'debug_forward') and self.debug_forward:
+                    print(f"文本特征形状: {text_features.shape}")
+                    print(f"文本特征数据范围: [{text_features.min().item():.4f}, {text_features.max().item():.4f}]")
+                    print(f"文本特征类型: {text_features.dtype}")
+                    print(f"文本特征设备: {text_features.device}")
+                
+                # 设置为模态上下文
+                modal_context = text_features
             
-            # 应用编码器层
-            layer_outputs = layer(x, modal_context)
-            x = layer_outputs['layer_output']
+            # 遍历编码器层
+            for layer_idx, layer in enumerate(self.layers):
+                if hasattr(self, 'debug_forward') and self.debug_forward:
+                    print(f"\n处理编码器层 {layer_idx + 1}/{len(self.layers)}:")
+                    print(f"输入形状: {x.shape}")
+                    print(f"输入数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                    print(f"输入数据类型: {x.dtype}")
+                    print(f"输入设备: {x.device}")
+                
+                # 应用编码器层
+                layer_outputs = layer(x, modal_context)
+                x = layer_outputs['layer_output']
+                
+                if hasattr(self, 'debug_forward') and self.debug_forward:
+                    print(f"层输出形状: {x.shape}")
+                    print(f"层输出数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                    print(f"层输出类型: {x.dtype}")
+                    print(f"层输出设备: {x.device}")
+                    if 'router_probs' in layer_outputs:
+                        router_probs = layer_outputs['router_probs']
+                        print(f"路由概率形状: {router_probs.shape}")
+                        print(f"路由概率范围: [{router_probs.min().item():.4f}, {router_probs.max().item():.4f}]")
+                        print(f"路由概率类型: {router_probs.dtype}")
+                        print(f"路由概率设备: {router_probs.device}")
+                
+                # 存储该层的输出
+                fusion_outputs[f'layer_{layer_idx}'] = {
+                    'router_logits': layer_outputs.get('router_logits', None),
+                    'router_probs': layer_outputs.get('router_probs', None),
+                    'expert_mask': layer_outputs.get('expert_mask', None),
+                    'layer_output': layer_outputs['layer_output']
+                }
+                
+                if return_attention and 'attention_weights' in layer_outputs:
+                    fusion_outputs[f'layer_{layer_idx}']['attention_weights'] = layer_outputs['attention_weights']
             
-            # 存储该层的输出
-            fusion_outputs[f'layer_{layer_idx}'] = {
-                'router_logits': layer_outputs.get('router_logits', None),
-                'router_probs': layer_outputs.get('router_probs', None),
-                'expert_mask': layer_outputs.get('expert_mask', None),
-                'layer_output': layer_outputs['layer_output']
+            # 应用最终的Layer Norm
+            x = self.norm(x)
+            
+            # 取[CLS] token或平均池化
+            if self.use_cls_token:
+                x = x[:, 0]
+            else:
+                x = x.mean(dim=1)
+            
+            if hasattr(self, 'debug_forward') and self.debug_forward:
+                print(f"\n最终特征:")
+                print(f"池化后形状: {x.shape}")
+                print(f"特征数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                print(f"特征类型: {x.dtype}")
+                print(f"特征设备: {x.device}")
+            
+            # 应用分类头
+            logits = self.classifier(x)
+            
+            if hasattr(self, 'debug_forward') and self.debug_forward:
+                print(f"\n分类输出:")
+                print(f"Logits形状: {logits.shape}")
+                print(f"Logits数据范围: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+                print(f"Logits类型: {logits.dtype}")
+                print(f"Logits设备: {logits.device}")
+            
+            # 计算路由损失
+            router_loss = torch.tensor(0.0, device=device)
+            for layer_idx in range(len(self.layers)):
+                layer_outputs = fusion_outputs[f'layer_{layer_idx}']
+                if 'router_logits' in layer_outputs and 'router_probs' in layer_outputs:
+                    router_loss = router_loss + self.router_z_loss * self.compute_z_loss(layer_outputs['router_logits'])
+                    router_loss = router_loss + self.router_aux_loss * self.compute_load_loss(layer_outputs['router_probs'])
+            
+            # 构建返回字典
+            outputs = {
+                'logits': logits,
+                'embeddings': x,
+                'router_loss': router_loss
             }
             
-            if return_attention and 'attention_weights' in layer_outputs:
-                fusion_outputs[f'layer_{layer_idx}']['attention_weights'] = layer_outputs['attention_weights']
-        
-        # 应用最终的Layer Norm
-        x = self.norm(x)
-        
-        # 取[CLS] token或平均池化
-        if self.use_cls_token:
-            x = x[:, 0]
-        else:
-            x = x.mean(dim=1)
-        
-        # 应用分类头
-        logits = self.classifier(x)
-        
-        # 计算路由损失
-        router_loss = torch.tensor(0.0, device=device)
-        for layer_idx in range(len(self.layers)):
-            layer_outputs = fusion_outputs[f'layer_{layer_idx}']
-            if 'router_logits' in layer_outputs and 'router_probs' in layer_outputs:
-                router_loss = router_loss + self.router_z_loss * self.compute_z_loss(layer_outputs['router_logits'])
-                router_loss = router_loss + self.router_aux_loss * self.compute_load_loss(layer_outputs['router_probs'])
-        
-        # 构建返回字典
-        outputs = {
-            'logits': logits,
-            'embeddings': x,
-            'router_loss': router_loss
-        }
-        
-        if return_attention:
-            outputs['fusion_outputs'] = fusion_outputs
-        
-        return outputs
+            if return_attention:
+                outputs['fusion_outputs'] = fusion_outputs
+            
+            return outputs
+            
+        except Exception as e:
+            print(f"\n[MultiModalMoE Forward] 错误:")
+            print(f"错误类型: {type(e).__name__}")
+            print(f"错误信息: {str(e)}")
+            print("\n输入状态:")
+            print(f"x形状: {x.shape if isinstance(x, torch.Tensor) else 'Not a tensor'}")
+            print(f"x类型: {type(x)}")
+            if isinstance(x, torch.Tensor):
+                print(f"x设备: {x.device}")
+                print(f"x数据类型: {x.dtype}")
+            if text_tokens is not None:
+                print(f"text_tokens形状: {text_tokens.shape if isinstance(text_tokens, torch.Tensor) else 'Not a tensor'}")
+            if attention_mask is not None:
+                print(f"attention_mask形状: {attention_mask.shape if isinstance(attention_mask, torch.Tensor) else 'Not a tensor'}")
+            import traceback
+            print("\n完整的错误追踪:")
+            print(traceback.format_exc())
+            raise
 
     def compute_z_loss(self, router_logits: torch.Tensor) -> torch.Tensor:
         """计算z损失来正则化路由逻辑

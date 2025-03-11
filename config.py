@@ -26,14 +26,14 @@ class DatasetConfig:
 class CIFAR10Config(DatasetConfig):
     """CIFAR-10专用配置"""
     def __post_init__(self):
-        self.patch_size = 4 
+        self.patch_size = 4  # 必须与model.py的patch_size匹配
         self.class_names = [
             'airplane', 'automobile', 'bird', 'cat', 'deer',
             'dog', 'frog', 'horse', 'ship', 'truck'
         ]
         self.data_dir = 'data'
         self.name = "CIFAR10"
-        self.image_size = (32, 32)
+        self.image_size = (32, 32)  # 必须与dataset_info的img_size一致
         self.mean = (0.4914, 0.4822, 0.4465)
         self.std = (0.2023, 0.1994, 0.2010)
         self.in_channels = 3

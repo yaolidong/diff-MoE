@@ -99,6 +99,14 @@ class DatasetManager:
     """数据集管理器"""
     
     def __init__(self, dataset_type: DatasetType, config: DatasetConfig, batch_size=128, num_workers=8):
+        """初始化数据集管理器
+        
+        Args:
+            dataset_type: 数据集类型
+            config: 数据集配置
+            batch_size: 批次大小
+            num_workers: 数据加载线程数
+        """
         self.dataset_type = dataset_type
         self.config = config
         self.batch_size = batch_size
@@ -115,25 +123,46 @@ class DatasetManager:
         if self.config.in_channels == 1:
             normalize_mean = self.config.mean if hasattr(self.config, 'mean') else (0.5,)
             normalize_std = self.config.std if hasattr(self.config, 'std') else (0.5,)
+            print(f"使用单通道归一化参数: mean={normalize_mean}, std={normalize_std}")
         else:
             normalize_mean = self.config.mean if hasattr(self.config, 'mean') else (0.5, 0.5, 0.5)
             normalize_std = self.config.std if hasattr(self.config, 'std') else (0.5, 0.5, 0.5)
+            print(f"使用三通道归一化参数: mean={normalize_mean}, std={normalize_std}")
             
-        image_size = self.config.image_size if hasattr(self.config, 'image_size') else (32, 32)
+        # 获取图像尺寸，确保是元组格式
+        if hasattr(self.config, 'image_size'):
+            if isinstance(self.config.image_size, int):
+                image_size = (self.config.image_size, self.config.image_size)
+            else:
+                image_size = self.config.image_size
+        else:
+            image_size = (32, 32)  # 默认尺寸
+            
+        print(f"设置图像尺寸为: {image_size}")
         
         # 为训练集添加更多数据增强，以提高模型泛化能力
-        self.train_transform = transforms.Compose([
+        train_transforms = [
             transforms.Resize(image_size),
-            # 添加随机裁剪和反转来增加数据多样性
             transforms.RandomCrop(image_size, padding=4),
             transforms.RandomHorizontalFlip(),
-            # 添加颜色扰动
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        ]
+        
+        # 根据数据集类型添加特定的增强
+        if self.dataset_type == DatasetType.CIFAR10:
+            train_transforms.extend([
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.RandomRotation(15),
+            ])
+            print("为CIFAR10添加额外的数据增强")
+            
+        train_transforms.extend([
             transforms.ToTensor(),
-            # 对于小批量数据，可以考虑添加随机擦除增强
             transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
             transforms.Normalize(normalize_mean, normalize_std)
         ])
+        
+        self.train_transform = transforms.Compose(train_transforms)
+        print("训练数据转换设置完成")
         
         # 测试集保持简单转换
         self.test_transform = transforms.Compose([
@@ -141,6 +170,10 @@ class DatasetManager:
             transforms.ToTensor(),
             transforms.Normalize(normalize_mean, normalize_std)
         ])
+        print("测试数据转换设置完成")
+        
+        # 打印转换后的预期输出形状
+        print(f"预期输出张量形状: [{self.config.in_channels}, {image_size[0]}, {image_size[1]}]")
         
     def collate_cifar10(self, batch):
         """CIFAR10的collate函数"""
@@ -272,6 +305,20 @@ class DatasetManager:
         
         return train_loader, test_loader, info
 
+    def get_dataset_info(self) -> Dict[str, Any]:
+        """获取数据集信息
+        
+        Returns:
+            包含数据集信息的字典
+        """
+        return {
+            'name': self.config.name,
+            'in_channels': self.config.in_channels,
+            'img_size': self.config.image_size[0] if isinstance(self.config.image_size, tuple) else self.config.image_size,
+            'class_names': self.config.class_names,
+            'num_classes': len(self.config.class_names)
+        }
+
 def get_dataset_and_loaders(dataset_name: str = 'cifar10', 
                           batch_size: int = 128) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """
@@ -320,73 +367,102 @@ def general_collate_fn(batch, dataset_name: str, device=None):
     Returns:
         处理后的批次数据
     """
-    # 注意：在修复版本中，我们不再在collate中将数据移至GPU
-    # 而是保持数据在CPU上，让DataLoader的pin_memory正常工作
-    
-    # 检查当前数据集的缓存
-    cache_key = f"{dataset_name}_descriptions"
-    if cache_key not in _PRELOADED_DESCRIPTIONS:
-        # 从缓存或首次加载
-        _PRELOADED_DESCRIPTIONS[cache_key] = get_text_descriptions(dataset_name)
-    
-    # Flickr8k数据集的特殊处理
-    if dataset_name.lower() == 'flickr8k':
-        # 获取图像，文本和标签
-        images, captions, labels = zip(*batch)
+    try:
+        # 检查当前数据集的缓存
+        cache_key = f"{dataset_name}_descriptions"
+        if cache_key not in _PRELOADED_DESCRIPTIONS:
+            # 从缓存或首次加载
+            _PRELOADED_DESCRIPTIONS[cache_key] = get_text_descriptions(dataset_name)
+            print(f"已加载{dataset_name}的文本描述")
         
-        # 堆叠图像和转换标签为张量
-        images = torch.stack(images)
-        labels = torch.tensor(labels)
+        # Flickr8k数据集的特殊处理
+        if dataset_name.lower() == 'flickr8k':
+            # 获取图像，文本和标签
+            images, captions, labels = zip(*batch)
+            
+            try:
+                # 堆叠图像和转换标签为张量
+                images = torch.stack(images)
+                labels = torch.tensor(labels)
+                print(f"Flickr8k批次数据形状 - 图像: {images.shape}, 标签: {labels.shape}")
+                
+                # 如果captions是字符串列表，则返回无需tokenize
+                if isinstance(captions[0], str):
+                    return images, captions, None, labels
+                
+                # 否则如果已经是tokenized，就直接处理
+                if isinstance(captions[0], dict) and 'input_ids' in captions[0]:
+                    input_ids = [cap['input_ids'] for cap in captions]
+                    attention_mask = [cap['attention_mask'] for cap in captions]
+                    input_ids = torch.stack(input_ids)
+                    attention_mask = torch.stack(attention_mask)
+                    print(f"Tokenized形状 - input_ids: {input_ids.shape}, attention_mask: {attention_mask.shape}")
+                    return images, input_ids, attention_mask, labels
+                
+                # 最后情况，是字典但没有input_ids
+                caption_tensors = {'input_ids': None}
+                return images, caption_tensors['input_ids'], None, labels
+                
+            except Exception as e:
+                print(f"处理Flickr8k批次时出错: {str(e)}")
+                raise
         
-        # 如果captions是字符串列表，则返回无需tokenize
-        if isinstance(captions[0], str):
-            return images, captions, None, labels
-        
-        # 否则如果已经是tokenized，就直接处理
-        if isinstance(captions[0], dict) and 'input_ids' in captions[0]:
-            input_ids = [cap['input_ids'] for cap in captions]
-            attention_mask = [cap['attention_mask'] for cap in captions]
-            return images, torch.stack(input_ids), torch.stack(attention_mask), labels
-        
-        # 最后情况，是字典但没有input_ids
-        caption_tensors = {'input_ids': None}
-        return images, caption_tensors['input_ids'], None, labels
-    
-    # 其他数据集的处理方式
-    images, labels = zip(*batch)
-    images = torch.stack(images)
-    labels = torch.tensor(labels)
-    
-    # 获取预先处理的tokenized描述
-    tokenized_descriptions = get_tokenized_descriptions(dataset_name)
-    
-    if not tokenized_descriptions:  # 如果没有可用的tokenized描述
-        # 使用预加载的原始文本描述
-        descriptions = _PRELOADED_DESCRIPTIONS[dataset_name]
-        # 将标签转换为文本描述
-        text_inputs = [descriptions.get(label.item(), "") for label in labels]
-        # 返回时不包含text tokens
-        return images, None, None, labels
-    
-    # 收集每个标签对应的tokenized描述
-    input_ids_list = []
-    attention_mask_list = []
-    
-    for label in labels:
-        label_id = label.item()
-        if label_id in tokenized_descriptions:
-            input_ids_list.append(tokenized_descriptions[label_id]['input_ids'])
-            attention_mask_list.append(tokenized_descriptions[label_id]['attention_mask'])
-        else:
-            # 使用空张量作为填充
-            input_ids_list.append(torch.zeros(77, dtype=torch.long))
-            attention_mask_list.append(torch.zeros(77, dtype=torch.long))
-    
-    # 转换为tensor
-    input_ids = torch.stack(input_ids_list)
-    attention_mask = torch.stack(attention_mask_list)
-    
-    return images, input_ids, attention_mask, labels
+        # 其他数据集的处理方式
+        try:
+            images, labels = zip(*batch)
+            images = torch.stack(images)
+            labels = torch.tensor(labels)
+            print(f"{dataset_name}批次数据形状 - 图像: {images.shape}, 标签: {labels.shape}")
+            
+            # 检查图像数据范围
+            img_min = images.min().item()
+            img_max = images.max().item()
+            img_mean = images.mean().item()
+            img_std = images.std().item()
+            print(f"图像统计信息 - 最小值: {img_min:.3f}, 最大值: {img_max:.3f}, 均值: {img_mean:.3f}, 标准差: {img_std:.3f}")
+            
+            # 获取预先处理的tokenized描述
+            tokenized_descriptions = get_tokenized_descriptions(dataset_name)
+            
+            if not tokenized_descriptions:  # 如果没有可用的tokenized描述
+                # 使用预加载的原始文本描述
+                descriptions = _PRELOADED_DESCRIPTIONS[dataset_name]
+                # 将标签转换为文本描述
+                text_inputs = [descriptions.get(label.item(), "") for label in labels]
+                print(f"使用原始文本描述，共{len(text_inputs)}个")
+                # 返回时不包含text tokens
+                return images, None, None, labels
+            
+            # 收集每个标签对应的tokenized描述
+            input_ids_list = []
+            attention_mask_list = []
+            
+            for label in labels:
+                label_id = label.item()
+                if label_id in tokenized_descriptions:
+                    input_ids_list.append(tokenized_descriptions[label_id]['input_ids'])
+                    attention_mask_list.append(tokenized_descriptions[label_id]['attention_mask'])
+                else:
+                    # 使用空张量作为填充
+                    input_ids_list.append(torch.zeros(77, dtype=torch.long))
+                    attention_mask_list.append(torch.zeros(77, dtype=torch.long))
+            
+            # 转换为tensor
+            input_ids = torch.stack(input_ids_list)
+            attention_mask = torch.stack(attention_mask_list)
+            print(f"Tokenized形状 - input_ids: {input_ids.shape}, attention_mask: {attention_mask.shape}")
+            
+            return images, input_ids, attention_mask, labels
+            
+        except Exception as e:
+            print(f"处理{dataset_name}批次时出错: {str(e)}")
+            raise
+            
+    except Exception as e:
+        print(f"collate_fn处理出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 def get_tokenized_descriptions(dataset_name):
     """
