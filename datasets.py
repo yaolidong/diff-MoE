@@ -12,9 +12,7 @@ from transformers import CLIPTokenizer
 # 在文件顶部添加缓存字典
 _DESCRIPTIONS_CACHE = {}
 
-#------------------------------------------------------------------------
-# 标签到文本描述的转换部分 (来自原 label_to_text.py)
-#------------------------------------------------------------------------
+
 
 # CIFAR-10数据集的类别描述
 CIFAR10_DESCRIPTIONS = {
@@ -57,16 +55,7 @@ FLICKR8K_DESCRIPTIONS = {
 }
 
 def get_text_descriptions(dataset_name):
-    """
-    根据数据集名称获取类别的文本描述，使用缓存避免重复加载
-    
-    Args:
-        dataset_name: 数据集名称，如'cifar10'或'fashion-mnist'
-        
-    Returns:
-        包含类别描述的字典，键为类别索引，值为文本描述
-    """
-    # 如果缓存中已有该数据集的描述，直接返回
+    """获取数据集的文本描述"""
     if dataset_name.lower() in _DESCRIPTIONS_CACHE:
         return _DESCRIPTIONS_CACHE[dataset_name.lower()]
     
@@ -82,57 +71,6 @@ def get_text_descriptions(dataset_name):
     else:
         _DESCRIPTIONS_CACHE[dataset_name.lower()] = {}
         return {}
-
-def get_enhanced_descriptions(dataset_name, detail_level='normal'):
-    """
-    获取增强的文本描述，可以根据需要的详细程度调整
-    
-    Args:
-        dataset_name: 数据集名称
-        detail_level: 详细程度，可以是'simple'、'normal'或'detailed'
-        
-    Returns:
-        增强的文本描述字典
-    """
-    base_descriptions = get_text_descriptions(dataset_name)
-    
-    if detail_level == 'simple':
-        # 返回简化版描述
-        return {k: v.split('，')[0] for k, v in base_descriptions.items()}
-    
-    elif detail_level == 'detailed':
-        # 这里可以返回更详细的描述
-        # 在实际应用中，可以从更大的文本语料库中获取
-        detailed_descriptions = {}
-        for k, v in base_descriptions.items():
-            detailed_descriptions[k] = v + " 这是一个常见的物体，在日常生活中经常可以看到。它有独特的特征和用途。"
-        return detailed_descriptions
-    
-    else:  # 'normal'
-        return base_descriptions
-
-def tokenize_text(text, max_length=32):
-    """
-    简单的文本标记化函数（示例）
-    
-    在实际应用中，应该使用专业的分词器如BERT、GPT等的tokenizer
-    
-    Args:
-        text: 要标记化的文本
-        max_length: 最大标记长度
-        
-    Returns:
-        标记化后的文本（这里简化为字符索引）
-    """
-    # 这只是一个非常简化的示例
-    # 实际应用中应该使用专业的tokenizer
-    chars = list(text[:max_length])
-    # 将字符转换为简单的数字索引（仅用于演示）
-    tokens = [ord(c) % 1000 for c in chars]
-    # 填充到最大长度
-    tokens = tokens + [0] * (max_length - len(tokens))
-    return tokens
-
 
 #------------------------------------------------------------------------
 # 数据集类定义部分
@@ -174,44 +112,10 @@ class Flickr8kDataset(Dataset):
         Returns:
             数据列表，每个元素是包含图像路径、标题和类别的字典
         """
-        # 加载数据
-        try:
-            # 尝试加载真实数据
-            metadata_path = os.path.join(self.root, f'flickr8k_{self.split}_metadata.json')
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            return metadata
-            
-        except FileNotFoundError:
-            # 创建模拟数据以进行测试
-            mock_data = []
-            num_samples = 100 if self.split == 'train' else 20
-            
-            for i in range(num_samples):
-                # 随机选择一个类别
-                category_idx = np.random.randint(0, len(FLICKR8K_DESCRIPTIONS))
-                
-                # 创建一个模拟的图像路径
-                image_id = f"mock_image_{i:05d}.jpg"
-                image_path = os.path.join(self.root, 'images', image_id)
-                
-                # 创建模拟的标题
-                category = self.class_names[category_idx]
-                captions = [f"这是一张关于{category}的图片，场景包含了多个元素。"]
-                
-                # 添加到数据列表
-                mock_data.append({
-                    'image_path': image_path,
-                    'captions': captions,
-                    'category': category_idx
-                })
-            
-            # 保存模拟数据
-            os.makedirs(os.path.dirname(os.path.join(self.root, f'flickr8k_{self.split}_metadata.json')), exist_ok=True)
-            with open(os.path.join(self.root, f'flickr8k_{self.split}_metadata.json'), 'w', encoding='utf-8') as f:
-                json.dump(mock_data, f, ensure_ascii=False, indent=2)
-            
-            return mock_data
+        metadata_path = os.path.join(self.root, f'flickr8k_{self.split}_metadata.json')
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        return metadata
     
     def __len__(self) -> int:
         """返回数据集大小"""
@@ -236,34 +140,24 @@ class Flickr8kDataset(Dataset):
         # 选择一个标题
         caption = captions[0] if captions else "无描述"
         
-        try:
-            # 加载图像
-            image = Image.open(image_path).convert('RGB')
-            
-            # 应用变换
-            if self.transform:
-                image = self.transform(image)
-            else:
-                # 默认变换
-                transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]
-                    )
-                ])
-                image = transform(image)
-                
-        except FileNotFoundError:
-            # 创建随机图像
-            random_image = torch.randn(3, 224, 224)
-            # 应用默认归一化
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            random_image = random_image * std + mean
-            image = random_image
-            
+        # 加载图像
+        image = Image.open(image_path).convert('RGB')
+        
+        # 应用变换
+        if self.transform:
+            image = self.transform(image)
+        else:
+            # 默认变换
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                )
+            ])
+            image = transform(image)
+        
         # 返回图像张量、标题字符串和类别索引
         return image, caption, category
         

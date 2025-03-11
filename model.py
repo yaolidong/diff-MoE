@@ -212,7 +212,7 @@ class PatchEmbed(nn.Module):
             )
         
         # 重塑为序列
-        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
+        x = x.flatten(2).transpose(1, 2).reshape(x.size(0), -1, self.embed_dim)
         
         if self.debug_forward:
             print(f"\n最终输出:")
@@ -284,6 +284,8 @@ class AttentiveRouter(nn.Module):
                 - expert_weights: 专家权重 [batch_size, seq_len, top_k]
                 - expert_indices: 专家索引 [batch_size, seq_len, top_k]
         """
+        # 确保输入张量是连续的
+        inputs = inputs.contiguous()
         batch_size, seq_len, input_dim = inputs.shape
         
         # 计算路由logits: [batch_size, seq_len, num_experts]
@@ -301,8 +303,15 @@ class AttentiveRouter(nn.Module):
             # Sigmoid版本 - 直接输出每个专家的重要性（可能值不是和为1）
             router_probs = torch.sigmoid(router_logits)
         
+        # 确保张量是连续的
+        router_probs = router_probs.contiguous()
+        
         # 获取top_k专家及其权重
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        
+        # 确保张量是连续的
+        top_k_probs = top_k_probs.contiguous()
+        top_k_indices = top_k_indices.contiguous()
         
         # 重新归一化top_k专家权重，使其和为1
         if self.use_softmax:
@@ -332,7 +341,8 @@ class UnifiedModalEncoder(nn.Module):
         activation: str = 'gelu',
         layer_norm_eps: float = 1e-5,
         use_bias: bool = True,
-        use_checkpoint: bool = False
+        use_checkpoint: bool = False,
+        capacity_factor: float = 1.5
     ):
         """初始化
         
@@ -347,6 +357,7 @@ class UnifiedModalEncoder(nn.Module):
             layer_norm_eps: Layer Norm的epsilon值
             use_bias: 是否使用偏置
             use_checkpoint: 是否使用梯度检查点
+            capacity_factor: 专家容量因子，控制每个专家可处理的最大token数量
         """
         super().__init__()
         
@@ -354,6 +365,7 @@ class UnifiedModalEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.num_shared_experts = num_shared_experts
         self.num_modality_specific_experts = num_modality_specific_experts
+        self.num_experts = num_shared_experts + num_modality_specific_experts  # 添加总专家数量
         self.top_k = top_k
         self.dropout = dropout
         self.num_heads = num_heads
@@ -361,6 +373,7 @@ class UnifiedModalEncoder(nn.Module):
         self.layer_norm_eps = layer_norm_eps
         self.use_bias = use_bias
         self.use_checkpoint = use_checkpoint
+        self.capacity_factor = capacity_factor  # 保存capacity_factor
         
         # Layer Norm层
         self.norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
@@ -408,10 +421,9 @@ class UnifiedModalEncoder(nn.Module):
         )
         
         # 路由器 - 决定每个token使用哪些专家
-        total_experts = num_shared_experts + num_modality_specific_experts
         self.router = AttentiveRouter(
             input_dim=embed_dim,
-            num_experts=total_experts,
+            num_experts=self.num_experts,
             top_k=top_k,
             dropout=dropout
         )
@@ -572,206 +584,67 @@ class UnifiedModalEncoder(nn.Module):
             tuple: (输出特征, 路由逻辑, 路由概率)
         """
         batch_size, seq_len, embed_dim = x.shape
+        total_tokens = batch_size * seq_len
         
-        # 调试信息
-        debug = hasattr(self, 'debug_forward') and self.debug_forward
-        if debug:
-            print(f"\n[Router Block] 输入:")
-            print(f"形状: {x.shape}")
-            print(f"数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+        # 获取路由器输出字典
+        router_outputs = self.router(x)  # 返回字典
+        router_logits = router_outputs['logits']  # 提取logits
+        router_probs = router_outputs['router_probs']  # 提取概率
+        expert_weights = router_outputs['expert_weights']  # 提取专家权重
+        expert_indices = router_outputs['expert_indices']  # 提取专家索引
         
-        # 路由决策 - 决定每个token应该送到哪些专家
-        # [batch_size, seq_len, num_experts]
-        router_outputs = self.router(x)
+        # 确保张量在重塑之前是连续的
+        x = x.contiguous()
+        expert_weights = expert_weights.contiguous()
+        expert_indices = expert_indices.contiguous()
         
-        # 获取路由logits和概率
-        router_logits = router_outputs['logits']  # [batch_size, seq_len, num_experts]
-        router_probs = router_outputs['router_probs']  # [batch_size, seq_len, num_experts]
+        # 展平所有维度以便处理
+        x_flat = x.reshape(-1, embed_dim)
+        expert_weights_flat = expert_weights.reshape(-1, self.top_k)
+        expert_indices_flat = expert_indices.reshape(-1, self.top_k)
         
-        if debug:
-            print(f"\n路由决策:")
-            print(f"Logits形状: {router_logits.shape}")
-            print(f"Logits范围: [{router_logits.min().item():.4f}, {router_logits.max().item():.4f}]")
-            print(f"概率形状: {router_probs.shape}")
-            print(f"概率范围: [{router_probs.min().item():.4f}, {router_probs.max().item():.4f}]")
+        # 初始化输出
+        final_output = torch.zeros_like(x_flat)
+        capacity = int(total_tokens * self.capacity_factor)
         
-        # 获取最终的专家分配和组合权重
-        # 每个token会被分配到top_k个专家
-        expert_weights = router_outputs['expert_weights']  # [batch_size, seq_len, top_k]
-        expert_indices = router_outputs['expert_indices']  # [batch_size, seq_len, top_k]
-        
-        if debug:
-            print(f"\n专家分配:")
-            print(f"权重形状: {expert_weights.shape}")
-            print(f"权重范围: [{expert_weights.min().item():.4f}, {expert_weights.max().item():.4f}]")
-            print(f"索引形状: {expert_indices.shape}")
-            print(f"索引范围: [{expert_indices.min().item()}, {expert_indices.max().item()}]")
-            print(f"专家使用统计:")
-            expert_counts = torch.zeros(len(self.shared_experts) + len(self.modality_specific_experts), 
-                                     device=expert_indices.device)
-            for i in range(expert_indices.size(-1)):
-                unique_experts, counts = torch.unique(expert_indices[:, :, i], return_counts=True)
-                for expert_idx, count in zip(unique_experts.tolist(), counts.tolist()):
-                    expert_counts[expert_idx] += count
-            total_tokens = batch_size * seq_len * self.top_k
-            for i, count in enumerate(expert_counts.tolist()):
-                usage_percent = count * 100 / total_tokens
-                if i < len(self.shared_experts):
-                    print(f"  共享专家 {i}: {usage_percent:.2f}% ({count}/{total_tokens})")
-                else:
-                    print(f"  特定专家 {i - len(self.shared_experts)}: {usage_percent:.2f}% ({count}/{total_tokens})")
-        
-        # 初始化输出tensor
-        final_output = torch.zeros_like(x)  # [batch_size, seq_len, embed_dim]
-        
-        # 展平输入以方便处理
-        flat_x = x.reshape(-1, embed_dim)  # [batch_size * seq_len, embed_dim]
-        
-        # 准备索引用于收集每个token对应的专家输出
-        # 创建token索引
-        token_indices = torch.arange(batch_size * seq_len, device=x.device)
-        
-        # 处理共享专家
-        shared_outputs = []
-        for i, expert in enumerate(self.shared_experts):
-            # 找出被路由到当前专家的所有token
-            expert_mask = (expert_indices == i)  # [batch_size, seq_len, top_k]
-            if not expert_mask.any():
-                if debug:
-                    print(f"共享专家 {i} 未被使用")
+        # 对每个专家分别处理
+        for expert_idx in range(self.num_experts):
+            # 找到选择了当前专家的所有token
+            expert_mask = (expert_indices_flat == expert_idx).any(dim=-1)
+            token_indices = torch.nonzero(expert_mask).squeeze(-1)
+            
+            # 如果没有token选择这个专家，跳过
+            if token_indices.numel() == 0:
                 continue
                 
-            # 展平mask
-            flat_mask = expert_mask.reshape(-1, self.top_k)  # [batch_size * seq_len, top_k]
+            # 获取这些token对应的权重
+            # 找到expert_idx在每个token的expert_indices中的位置
+            expert_pos = (expert_indices_flat == expert_idx).nonzero()[:, 1]
+            expert_probs = expert_weights_flat[token_indices, expert_pos]
             
-            # 找出至少有一个专家被路由到当前专家的token
-            token_mask = flat_mask.any(dim=-1)  # [batch_size * seq_len]
+            # 限制每个专家处理的token数量
+            if len(token_indices) > capacity:
+                # 只处理权重最高的tokens
+                _, top_capacity_indices = torch.topk(expert_probs, k=capacity)
+                token_indices = token_indices[top_capacity_indices]
+                expert_probs = expert_probs[top_capacity_indices]
             
-            if not token_mask.any():
-                if debug:
-                    print(f"共享专家 {i} 没有有效的token")
-                continue
-                
-            # 选择这些token
-            selected_tokens = token_indices[token_mask]  # [num_selected]
-            selected_inputs = flat_x[selected_tokens]  # [num_selected, embed_dim]
+            # 获取需要处理的输入
+            expert_inputs = x_flat[token_indices]
             
-            if debug:
-                print(f"\n处理共享专家 {i}:")
-                print(f"选中的token数量: {len(selected_tokens)}")
-                print(f"输入形状: {selected_inputs.shape}")
-                print(f"输入范围: [{selected_inputs.min().item():.4f}, {selected_inputs.max().item():.4f}]")
+            # 通过专家处理
+            if expert_idx < len(self.shared_experts):
+                expert_output = self.shared_experts[expert_idx](expert_inputs)
+            else:
+                # 如果是模态特定专家
+                modal_expert_idx = expert_idx - len(self.shared_experts)
+                expert_output = self.modality_specific_experts[modal_expert_idx](expert_inputs)
             
-            # 应用专家
-            expert_output = expert(selected_inputs)
-            
-            if debug:
-                print(f"专家输出形状: {expert_output.shape}")
-                print(f"输出范围: [{expert_output.min().item():.4f}, {expert_output.max().item():.4f}]")
-            
-            # 收集每个被路由到当前专家的token对（token_idx, expert_idx）
-            # 并计算其组合权重
-            for k in range(self.top_k):
-                # 当前专家索引在k位置的mask
-                k_mask = expert_mask[:, :, k].reshape(-1)  # [batch_size * seq_len]
-                
-                if not k_mask.any():
-                    continue
-                    
-                # 选择这些token
-                k_tokens = token_indices[k_mask]  # [num_k_selected]
-                
-                # 获取权重
-                k_weights = expert_weights[:, :, k].reshape(-1)[k_mask]  # [num_k_selected]
-                
-                # 获取这些token在被选中的token中的索引
-                k_selected_indices = torch.zeros_like(token_mask, dtype=torch.bool)
-                k_selected_indices[k_tokens] = True
-                k_selected_indices = k_selected_indices & token_mask  # 确保只选择被路由到当前专家的token
-                k_indices_in_selected = torch.nonzero(k_selected_indices).squeeze(-1)  # [num_k_selected]
-                
-                # 加权求和
-                final_output.reshape(-1, embed_dim)[k_tokens] += k_weights.unsqueeze(-1) * expert_output[k_indices_in_selected]
-                
-                if debug:
-                    print(f"  位置 {k}:")
-                    print(f"  - 选中的token数量: {len(k_tokens)}")
-                    print(f"  - 权重范围: [{k_weights.min().item():.4f}, {k_weights.max().item():.4f}]")
+            # 将专家输出加到最终输出中
+            final_output[token_indices] += expert_probs.unsqueeze(-1) * expert_output
         
-        # 处理模态特定专家
-        modality_specific_outputs = []
-        for i, expert in enumerate(self.modality_specific_experts):
-            # 调整专家索引（共享专家之后）
-            expert_idx = i + len(self.shared_experts)
-            
-            # 找出被路由到当前专家的所有token
-            expert_mask = (expert_indices == expert_idx)  # [batch_size, seq_len, top_k]
-            if not expert_mask.any():
-                if debug:
-                    print(f"特定专家 {i} 未被使用")
-                continue
-                
-            # 展平mask
-            flat_mask = expert_mask.reshape(-1, self.top_k)  # [batch_size * seq_len, top_k]
-            
-            # 找出至少有一个专家被路由到当前专家的token
-            token_mask = flat_mask.any(dim=-1)  # [batch_size * seq_len]
-            
-            if not token_mask.any():
-                if debug:
-                    print(f"特定专家 {i} 没有有效的token")
-                continue
-                
-            # 选择这些token
-            selected_tokens = token_indices[token_mask]  # [num_selected]
-            selected_inputs = flat_x[selected_tokens]  # [num_selected, embed_dim]
-            
-            if debug:
-                print(f"\n处理特定专家 {i}:")
-                print(f"选中的token数量: {len(selected_tokens)}")
-                print(f"输入形状: {selected_inputs.shape}")
-                print(f"输入范围: [{selected_inputs.min().item():.4f}, {selected_inputs.max().item():.4f}]")
-            
-            # 应用专家
-            expert_output = expert(selected_inputs)
-            
-            if debug:
-                print(f"专家输出形状: {expert_output.shape}")
-                print(f"输出范围: [{expert_output.min().item():.4f}, {expert_output.max().item():.4f}]")
-            
-            # 收集每个被路由到当前专家的token对（token_idx, expert_idx）
-            # 并计算其组合权重
-            for k in range(self.top_k):
-                # 当前专家索引在k位置的mask
-                k_mask = expert_mask[:, :, k].reshape(-1)  # [batch_size * seq_len]
-                
-                if not k_mask.any():
-                    continue
-                    
-                # 选择这些token
-                k_tokens = token_indices[k_mask]  # [num_k_selected]
-                
-                # 获取权重
-                k_weights = expert_weights[:, :, k].reshape(-1)[k_mask]  # [num_k_selected]
-                
-                # 获取这些token在被选中的token中的索引
-                k_selected_indices = torch.zeros_like(token_mask, dtype=torch.bool)
-                k_selected_indices[k_tokens] = True
-                k_selected_indices = k_selected_indices & token_mask  # 确保只选择被路由到当前专家的token
-                k_indices_in_selected = torch.nonzero(k_selected_indices).squeeze(-1)  # [num_k_selected]
-                
-                # 加权求和
-                final_output.reshape(-1, embed_dim)[k_tokens] += k_weights.unsqueeze(-1) * expert_output[k_indices_in_selected]
-                
-                if debug:
-                    print(f"  位置 {k}:")
-                    print(f"  - 选中的token数量: {len(k_tokens)}")
-                    print(f"  - 权重范围: [{k_weights.min().item():.4f}, {k_weights.max().item():.4f}]")
-        
-        if debug:
-            print(f"\n最终输出:")
-            print(f"形状: {final_output.shape}")
-            print(f"数据范围: [{final_output.min().item():.4f}, {final_output.max().item():.4f}]")
+        # 重塑回原始维度
+        final_output = final_output.reshape(batch_size, seq_len, embed_dim)
         
         return final_output, router_logits, router_probs
 
@@ -885,7 +758,8 @@ class MultiModalMoE(nn.Module):
         moe_layer: str = 'parallel',
         use_gating: bool = True,
         use_attention: bool = True,
-        device: str = 'cuda'
+        device: str = None,
+        capacity_factor: float = 1.5
     ):
         """初始化多模态MoE模型
         
@@ -913,9 +787,20 @@ class MultiModalMoE(nn.Module):
             moe_layer: MoE层类型
             use_gating: 是否使用门控
             use_attention: 是否使用注意力
-            device: 设备
+            device: 设备，如果为None则自动选择
+            capacity_factor: 专家容量因子
         """
         super().__init__()
+        
+        # 自动选择设备
+        if device is None:
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
+        self.device = device
         
         # 保存配置
         self.config = {
@@ -982,7 +867,8 @@ class MultiModalMoE(nn.Module):
                 num_heads=num_heads,
                 activation=activation,
                 layer_norm_eps=layer_norm_eps,
-                use_checkpoint=use_gradient_checkpointing
+                use_checkpoint=use_gradient_checkpointing,
+                capacity_factor=capacity_factor
             )
             for _ in range(num_layers)
         ])
@@ -1012,13 +898,13 @@ class MultiModalMoE(nn.Module):
         
         # 添加文本描述处理
         self.text_descriptions = text_descriptions
-        self.device = device
         
         # 添加新参数到配置
         self.expert_type = expert_type
         self.moe_layer = moe_layer
         self.use_gating = use_gating
         self.use_attention = use_attention
+        self.capacity_factor = capacity_factor
         
     def _init_weights(self, module):
         """初始化模型权重"""

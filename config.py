@@ -2,6 +2,50 @@
 from dataclasses import dataclass, field, asdict
 import os
 from typing import Tuple, List, Dict, Any
+import torch
+
+@dataclass
+class DeviceConfig:
+    """设备配置"""
+    def __post_init__(self):
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+            self.device_name = 'CUDA'
+            self.device_properties = {
+                'name': torch.cuda.get_device_name(0),
+                'capability': torch.cuda.get_device_capability(0),
+                'memory': f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB"
+            }
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+            self.device_name = 'MPS'
+            self.device_properties = {'name': 'Apple Silicon'}
+        else:
+            self.device = torch.device('cpu')
+            self.device_name = 'CPU'
+            self.device_properties = {'name': 'CPU'}
+            
+    def __str__(self) -> str:
+        return f"使用设备: {self.device_name} ({self.device_properties['name']})"
+
+@dataclass
+class GlobalConfig:
+    """全局配置"""
+    # 设备配置
+    device: DeviceConfig = field(default_factory=DeviceConfig)
+    
+    # 随机种子
+    seed: int = 42
+    
+    # 是否启用调试模式
+    debug: bool = False
+    
+    # 日志配置
+    log_dir: str = 'logs'
+    log_level: str = 'INFO'
+    
+    def __post_init__(self):
+        os.makedirs(self.log_dir, exist_ok=True)
 
 @dataclass
 class DatasetConfig:
@@ -97,22 +141,27 @@ class TrainingConfig:
 @dataclass
 class ModelConfig:
     """模型配置"""
-    # 基础参数
-    embed_dim: int = 512
-    num_shared_experts: int = 4
-    num_modality_specific_experts: int = 2
-    top_k: int = 2
-    dropout: float = 0.2
-    num_heads: int = 8
-    num_layers: int = 6
-    
-    # 激活函数和归一化
-    activation: str = 'gelu'
-    layer_norm_eps: float = 1e-5
-    
-    # 初始化参数
-    initializer_range: float = 0.02
-    
+    def __init__(self):
+        # 基础参数
+        self.embed_dim = 768  # 嵌入维度
+        self.num_heads = 12  # 注意力头数
+        self.num_layers = 12  # Transformer层数
+        self.dropout = 0.1  # Dropout率
+        self.vocab_size = 49408  # 词汇表大小，匹配CLIP tokenizer
+        
+        # MoE相关参数
+        self.num_shared_experts = 4  # 共享专家数量
+        self.num_modality_specific_experts = 2  # 每个模态的专家数量
+        self.top_k = 2  # 每个样本选择的专家数量
+        self.capacity_factor = 1.5  # 专家容量因子
+        
+        # 激活函数和归一化
+        self.activation = 'gelu'
+        self.layer_norm_eps = 1e-5
+        
+        # 初始化参数
+        self.initializer_range = 0.02
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return asdict(self)

@@ -4,34 +4,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch.nn as nn
+import random
 from typing import Dict, List, Any, Tuple, Optional, Union
 from scipy.ndimage import zoom
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+from config import GlobalConfig
 
-def setup_environment():
+def setup_environment(config: GlobalConfig):
     """设置环境
     
+    Args:
+        config: 全局配置对象
+        
     Returns:
         运行设备
     """
-    # 设置设备
-    device = get_device()
+    # 获取设备
+    device = config.device.device
     
     # 设置随机种子
-    torch.manual_seed(42)
+    seed = config.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         
     return device
-
-def get_device():
-    """获取可用的设备"""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
 
 def get_model_size(model: torch.nn.Module) -> str:
     """获取模型大小
@@ -53,7 +55,7 @@ def get_model_size(model: torch.nn.Module) -> str:
         size_all_mb = (param_size + buffer_size) / 1024**2
         return f"{size_all_mb:.2f} MB"
     except Exception as e:
-        return "未知"
+        return f"计算模型大小时出错: {str(e)}"
 
 def set_chinese_font():
     """设置中文字体"""
