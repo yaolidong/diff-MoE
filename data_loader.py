@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision
 from torchvision import transforms
 from transformers import CLIPTokenizer
-from datasets import get_text_descriptions, Flickr8kDataset
+from datasets import get_text_descriptions, Flickr8kDataset, TextEnhancedDataset
 import os
 from typing import Tuple, Dict, Any
 from enum import Enum
@@ -75,44 +75,91 @@ class DatasetManager:
             训练集、验证集和测试集
         """
         if self.dataset_type == DatasetType.CIFAR10:
-            train_dataset = torchvision.datasets.CIFAR10(
+            # 获取CIFAR10原始数据集
+            train_dataset_raw = torchvision.datasets.CIFAR10(
                 root=self.config.data_dir,
                 train=True,
                 download=True,
                 transform=self.train_transform
             )
             # 分割训练集为训练集和验证集
-            train_size = int(0.8 * len(train_dataset))
-            val_size = len(train_dataset) - train_size
-            train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+            train_size = int(0.8 * len(train_dataset_raw))
+            val_size = len(train_dataset_raw) - train_size
+            train_dataset_raw, val_dataset_raw = torch.utils.data.random_split(train_dataset_raw, [train_size, val_size])
             
-            test_dataset = torchvision.datasets.CIFAR10(
+            test_dataset_raw = torchvision.datasets.CIFAR10(
                 root=self.config.data_dir,
                 train=False,
                 download=True,
                 transform=self.test_transform
+            )
+            
+            # 获取CIFAR10文本描述
+            text_descriptions = get_text_descriptions('cifar10')
+            
+            # 使用TextEnhancedDataset包装原始数据集
+            train_dataset = TextEnhancedDataset(
+                train_dataset_raw, 
+                text_descriptions, 
+                max_length=self.get_dataset_info().get('max_text_len', 77)
+            )
+            
+            val_dataset = TextEnhancedDataset(
+                val_dataset_raw, 
+                text_descriptions, 
+                max_length=self.get_dataset_info().get('max_text_len', 77)
+            )
+            
+            test_dataset = TextEnhancedDataset(
+                test_dataset_raw, 
+                text_descriptions, 
+                max_length=self.get_dataset_info().get('max_text_len', 77)
             )
             
         elif self.dataset_type == DatasetType.FASHION_MNIST:
-            train_dataset = torchvision.datasets.FashionMNIST(
+            # 获取FashionMNIST原始数据集
+            train_dataset_raw = torchvision.datasets.FashionMNIST(
                 root=self.config.data_dir,
                 train=True,
                 download=True,
                 transform=self.train_transform
             )
             # 分割训练集为训练集和验证集
-            train_size = int(0.8 * len(train_dataset))
-            val_size = len(train_dataset) - train_size
-            train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+            train_size = int(0.8 * len(train_dataset_raw))
+            val_size = len(train_dataset_raw) - train_size
+            train_dataset_raw, val_dataset_raw = torch.utils.data.random_split(train_dataset_raw, [train_size, val_size])
             
-            test_dataset = torchvision.datasets.FashionMNIST(
+            test_dataset_raw = torchvision.datasets.FashionMNIST(
                 root=self.config.data_dir,
                 train=False,
                 download=True,
                 transform=self.test_transform
             )
             
+            # 获取FashionMNIST文本描述
+            text_descriptions = get_text_descriptions('fashion_mnist')
+            
+            # 使用TextEnhancedDataset包装原始数据集
+            train_dataset = TextEnhancedDataset(
+                train_dataset_raw, 
+                text_descriptions, 
+                max_length=self.get_dataset_info().get('max_text_len', 77)
+            )
+            
+            val_dataset = TextEnhancedDataset(
+                val_dataset_raw, 
+                text_descriptions, 
+                max_length=self.get_dataset_info().get('max_text_len', 77)
+            )
+            
+            test_dataset = TextEnhancedDataset(
+                test_dataset_raw, 
+                text_descriptions, 
+                max_length=self.get_dataset_info().get('max_text_len', 77)
+            )
+            
         elif self.dataset_type == DatasetType.FLICKR8K:
+            # Flickr8k已经是多模态数据集，无需包装
             train_dataset = Flickr8kDataset(
                 root=self.config.data_dir,
                 split='train',

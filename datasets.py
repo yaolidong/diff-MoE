@@ -76,6 +76,72 @@ def get_text_descriptions(dataset_name):
 # 数据集类定义部分
 #------------------------------------------------------------------------
 
+class TextEnhancedDataset(Dataset):
+    """文本增强数据集
+    
+    为单模态数据集添加文本描述，以支持跨模态训练
+    """
+    def __init__(self, dataset, text_descriptions, max_length=77):
+        """
+        初始化文本增强数据集
+        
+        Args:
+            dataset: 原始数据集
+            text_descriptions: 类别到文本描述的映射字典
+            max_length: 文本序列的最大长度
+        """
+        self.dataset = dataset
+        self.text_descriptions = text_descriptions
+        self.max_length = max_length
+        self.tokenizer = self._get_tokenizer()
+        print(f"创建文本增强数据集，包含{len(dataset)}个样本")
+        
+    def _get_tokenizer(self):
+        """获取CLIP tokenizer"""
+        return Flickr8kDataset.get_clip_tokenizer()
+        
+    def __len__(self):
+        """返回数据集大小"""
+        return len(self.dataset)
+        
+    def __getitem__(self, idx):
+        """获取指定索引的样本，并添加文本描述
+        
+        Args:
+            idx: 样本索引
+            
+        Returns:
+            图像张量、文本token、注意力掩码和标签的元组
+        """
+        # 获取原始样本
+        sample = self.dataset[idx]
+        
+        if isinstance(sample, tuple) and len(sample) >= 2:
+            # 处理常规数据集，返回(image, label)
+            image = sample[0]
+            label = sample[1]
+            
+            # 获取对应标签的文本描述
+            text = self.text_descriptions.get(int(label), "无描述")
+            
+            # 对文本进行编码
+            tokens = self.tokenizer(
+                text,
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            
+            # 去掉批次维度
+            input_ids = tokens.input_ids.squeeze(0)
+            attention_mask = tokens.attention_mask.squeeze(0)
+            
+            return image, input_ids, attention_mask, label
+        else:
+            # 处理其他格式的数据集
+            return sample
+
 class Flickr8kDataset(Dataset):
     """Flickr8k数据集类
     

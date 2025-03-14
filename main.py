@@ -1,34 +1,21 @@
 import os
-import sys
-import time
 import datetime  # 添加 datetime 模块导入
-import numpy as np
 import torch
-import torch.nn as nn
-import argparse
-import logging
 from data_loader import DatasetManager, DatasetType
 from model import MultiModalMoE
 from train import train
 from datasets import (
-    get_text_descriptions,
     CIFAR10_DESCRIPTIONS,
     FASHION_MNIST_DESCRIPTIONS,
     FLICKR8K_DESCRIPTIONS
 )
-from utils import setup_environment, plot_training_curves, print_model_summary, plot_confusion_matrix, visualize_predictions, visualize_expert_regions, visualize_expert_activations
-from packaging import version  # 添加版本比较支持
 from test import evaluate  # 修改导入语句
 from config import CIFAR10Config, FashionMNISTConfig, Flickr8kConfig, GlobalConfig, TrainingConfig, ModelConfig
-
-# 设置日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('debug.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
+from utils import (
+    setup_environment, plot_training_curves, print_model_summary, 
+    set_chinese_font, save_confusion_matrix, visualize_predictions, 
+    visualize_expert_regions, visualize_expert_activations,
+    visualize_predictions_with_descriptions
 )
 
 # 完全禁用PyTorch编译优化
@@ -46,42 +33,25 @@ def create_model(dataset_info, config: ModelConfig, device):
     Returns:
         创建的模型
     """
-    # 从数据集信息中获取参数
-    in_channels = dataset_info['in_channels']
-    img_size = dataset_info['img_size']
-    num_classes = dataset_info['num_classes']
-    patch_size = dataset_info.get('patch_size', 4)
-    max_text_len = dataset_info.get('max_text_len', 32)
-    text_embed_dim = dataset_info.get('text_embed_dim', 128)
-    
-    # 创建模型
     model = MultiModalMoE(
-        in_channels=in_channels,
-        img_size=img_size,
-        patch_size=patch_size,
-        num_classes=num_classes,
+        in_channels=dataset_info['in_channels'],
+        img_size=dataset_info['img_size'],
+        patch_size=dataset_info.get('patch_size', 4),
+        num_classes=dataset_info['num_classes'],
         embed_dim=config.embed_dim,
-        num_shared_experts=config.num_shared_experts,
-        num_modality_specific_experts=config.num_modality_specific_experts,
-        top_k=config.top_k,
+        num_general_experts=8,  # 设置一般专家数量
+        top_k=2,  # 设置top-k值
         dropout=config.dropout,
         num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        capacity_factor=config.capacity_factor,
-        device=device,  # 直接传递device对象
+        img_encoder_layers=6,  # 图像MoE编码器层数
+        text_encoder_layers=4,  # 文本MoE编码器层数
+        fusion_layers=3,  # 融合层数
+        device=device,
         vocab_size=config.vocab_size,
-        max_text_len=max_text_len,
-        text_embed_dim=text_embed_dim
+        max_text_len=dataset_info.get('max_text_len', 32),
+        text_embed_dim=dataset_info.get('text_embed_dim', 128),
+        use_checkpoint=config.use_checkpoint
     )
-    
-    # 打印模型信息
-    logging.info(f"创建模型: MultiModalMoE")
-    logging.info(f"输入通道数: {in_channels}, 图像大小: {img_size}x{img_size}, 类别数: {num_classes}")
-    logging.info(f"Patch大小: {patch_size}")
-    logging.info(f"嵌入维度: {config.embed_dim}, 共享专家数: {config.num_shared_experts}, 模态特定专家数: {config.num_modality_specific_experts}")
-    logging.info(f"Top-K: {config.top_k}, Dropout: {config.dropout}, 注意力头数: {config.num_heads}, 层数: {config.num_layers}")
-    logging.info(f"专家容量因子: {config.capacity_factor}")
-    logging.info(f"设备: {device}")  # 添加设备信息的日志
     
     return model.to(device)
 
@@ -97,155 +67,183 @@ def load_checkpoint(model, checkpoint_path, device):
         加载了检查点的模型和最佳验证准确率
     """
     if not os.path.exists(checkpoint_path):
-        logging.warning(f"检查点文件不存在: {checkpoint_path}")
+        print(f"检查点文件不存在: {checkpoint_path}")
         return model, 0
     
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         best_val_acc = checkpoint.get('best_val_acc', 0)
-        logging.info(f"成功加载检查点，最佳验证准确率: {best_val_acc:.2f}%")
+        print(f"成功加载检查点，最佳验证准确率: {best_val_acc:.2f}%")
         return model, best_val_acc
     except Exception as e:
-        logging.error(f"加载检查点时出错: {str(e)}")
+        print(f"加载检查点时出错: {str(e)}")
         return model, 0
 
-def main(args):
+def main():
     """主函数
-    
-    Args:
-        args: 命令行参数
     """
     # 创建全局配置
     global_config = GlobalConfig()
-    global_config.debug = args.debug
-    
-    # 设置日志
-    logging.basicConfig(
-        level=logging.DEBUG if global_config.debug else logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
-    # 初始化环境
-    logging.info("初始化环境...")
-    device = setup_environment(global_config)
-    logging.info(f"使用设备: {device}")
-    
-    # 根据数据集名称选择配置
-    if args.dataset.lower() == 'cifar10':
-        dataset_config = CIFAR10Config()
-        dataset_type = DatasetType.CIFAR10
-        class_descriptions = CIFAR10_DESCRIPTIONS
-    elif args.dataset.lower() == 'fashion_mnist':
-        dataset_config = FashionMNISTConfig()
-        dataset_type = DatasetType.FASHION_MNIST
-        class_descriptions = FASHION_MNIST_DESCRIPTIONS
-    elif args.dataset.lower() == 'flickr8k':
-        dataset_config = Flickr8kConfig()
-        dataset_type = DatasetType.FLICKR8K
-        class_descriptions = FLICKR8K_DESCRIPTIONS
-    else:
-        raise ValueError(f"不支持的数据集: {args.dataset}")
-    
-    # 创建训练配置
-    training_config = TrainingConfig()
-    training_config.num_epochs = args.num_epochs
-    training_config.batch_size = args.batch_size
-    training_config.learning_rate = args.learning_rate
-    training_config.weight_decay = args.weight_decay
-    
-    # 将训练配置添加到全局配置
-    global_config.training = training_config
+    # 设置训练配置
+    global_config.training = TrainingConfig()
     
     # 创建模型配置
     model_config = ModelConfig()
     
+    # 初始化环境
+    device = setup_environment(global_config)
+    
+    # 选择数据集配置 - 默认使用CIFAR10
+    dataset_config = CIFAR10Config()
+    
     # 创建数据集管理器
     dataset_manager = DatasetManager(
-        dataset_type=dataset_type, 
-        config=dataset_config, 
-        batch_size=args.batch_size
+        DatasetType.CIFAR10, 
+        dataset_config, 
+        batch_size=global_config.training.batch_size
     )
     train_loader, val_loader, test_loader = dataset_manager.get_data_loaders()
     dataset_info = dataset_manager.get_dataset_info()
-    logging.info(f"数据集初始化完成: {dataset_info['name']}")
+    
+    # 获取文本描述
+    class_descriptions = None
+    if dataset_config.name == "CIFAR10":
+        class_descriptions = CIFAR10_DESCRIPTIONS
+    elif dataset_config.name == "FashionMNIST":
+        
+        class_descriptions = FASHION_MNIST_DESCRIPTIONS
+    elif dataset_config.name == "Flickr8k":
+        class_descriptions = FLICKR8K_DESCRIPTIONS
     
     # 创建模型
     model = create_model(dataset_info, model_config, device)
     
     # 设置保存路径
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = os.path.join(args.save_dir, f"{args.dataset}_{timestamp}")
+    save_dir = os.path.join(global_config.training.checkpoint_dir, f"{dataset_config.name}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, "best_model.pth")
     
-    # 根据模式执行不同操作
-    if args.mode == 'train':
-        # 训练模式
-        logging.info("开始训练模式...")
-        
-        # 创建优化器和学习率调度器
-        optimizer = torch.optim.AdamW(
-            model.parameters(), 
-            lr=args.learning_rate, 
-            weight_decay=args.weight_decay
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=args.num_epochs
-        )
-        
-        # 训练模型
-        model, metrics = train(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            config=global_config,
-            save_path=save_path,
-            class_descriptions=class_descriptions,
-            optimizer=optimizer,
-            scheduler=scheduler
-        )
-        
-        # 绘制训练曲线
-        plot_path = os.path.join(save_dir, "training_curves.png")
-        plot_training_curves(metrics, save_path=plot_path)
-        logging.info(f"训练曲线已保存到: {plot_path}")
-        
-        # 在测试集上评估
-        logging.info("在测试集上评估模型...")
-        test_results = evaluate(model, test_loader, device, class_names=dataset_info['class_names'], class_descriptions=class_descriptions)
-        print_model_summary(model, test_results, dataset_info['class_names'])
-        
-    elif args.mode == 'test':
-        # 测试模式
-        logging.info("开始测试模式...")
-        
-        # 加载检查点
-        checkpoint_path = args.checkpoint_path
-        if not checkpoint_path:
-            checkpoint_path = training_config.checkpoint_path
-        
-        model, _ = load_checkpoint(model, checkpoint_path, device)
-        
-        # 在测试集上评估
-        test_results = evaluate(model, test_loader, device, class_names=dataset_info['class_names'], class_descriptions=class_descriptions)
-        print_model_summary(model, test_results, dataset_info['class_names'])
+    # 创建优化器和学习率调度器
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=global_config.training.learning_rate, 
+        weight_decay=global_config.training.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=global_config.training.num_epochs,
+        eta_min=global_config.training.learning_rate / 100  # 设置最小学习率，避免降至0
+    )
     
-    else:
-        raise ValueError(f"不支持的模式: {args.mode}")
+    # 训练模型
+    model, metrics = train(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=global_config,
+        save_path=save_path,
+        class_descriptions=class_descriptions,
+        optimizer=optimizer,
+        scheduler=scheduler
+    )
+    
+    # 绘制训练曲线
+    plot_path = os.path.join(save_dir, "training_curves.png")
+    plot_training_curves(metrics, save_path=plot_path)
+    
+    # 在测试集上评估
+    test_results = evaluate(model, test_loader, device, class_names=dataset_info['class_names'], class_descriptions=class_descriptions)
+    print_model_summary(model, test_results, dataset_info['class_names'])
+    
+    # 设置可视化保存目录
+    vis_dir = os.path.join(save_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # 设置中文字体
+    set_chinese_font()
+    
+    # 可视化混淆矩阵
+    cm_path = os.path.join(vis_dir, "confusion_matrix.png")
+    if test_results.get('confusion_matrix') is not None and dataset_info.get('class_names'):
+        save_confusion_matrix(
+            test_results['confusion_matrix'], 
+            dataset_info['class_names'],
+            save_path=cm_path
+        )
+    
+    # 获取一批测试数据
+    batch_data = next(iter(test_loader))
+    if len(batch_data) == 4:  # 多模态数据
+        images, input_ids, attention_mask, labels = batch_data
+    else:  # 只有图像数据
+        images, labels = batch_data
+    
+    # 可视化预测
+    pred_path = os.path.join(vis_dir, "predictions.png")
+    visualize_predictions(
+        model,
+        images[:16],  # 只取前16张图像
+        labels[:16],
+        device,
+        dataset_info['class_names'],
+        save_path=pred_path
+    )
+    
+    # 使用中文类别描述可视化预测
+    pred_cn_path = os.path.join(vis_dir, "predictions_cn.png")
+    visualize_predictions_with_descriptions(
+        model,
+        images[:16],  # 只取前16张图像
+        labels[:16],
+        device,
+        dataset_info['class_names'],
+        class_descriptions=class_descriptions,
+        save_path=pred_cn_path
+    )
+    
+    # 可视化专家区域
+    try:
+        for i in range(min(5, len(images))):  # 可视化前5张图片的专家区域
+            expert_path = os.path.join(vis_dir, f"expert_regions_{i}.png")
+            visualize_expert_regions(
+                model,
+                images[i],
+                device,
+                layer_idx=0,  # 可视化第一层专家
+                save_path=expert_path
+            )
+    except Exception:
+        pass
+    
+    # 运行一次前向传播，尝试获取专家激活
+    try:
+        model.eval()
+        with torch.no_grad():
+            test_image = images[0].to(device)
+            if len(batch_data) == 4:  # 多模态数据
+                outputs = model(
+                    test_image.unsqueeze(0), 
+                    text_tokens=input_ids[0].unsqueeze(0).to(device),
+                    attention_mask=attention_mask[0].unsqueeze(0).to(device)
+                )
+            else:  # 只有图像数据
+                outputs = model(test_image.unsqueeze(0))
+                
+            # 可视化专家激活
+            if 'expert_activations' in outputs:
+                expert_act_path = os.path.join(vis_dir, "expert_activations.png")
+                visualize_expert_activations(
+                    outputs,
+                    test_image,
+                    class_name=dataset_info['class_names'][labels[0].item()] if labels[0].item() < len(dataset_info['class_names']) else None,
+                    save_path=expert_act_path
+                )
+    except Exception:
+        pass
+    
+    print(f"\n训练和评估完成。结果保存在: {save_dir}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="多模态混合专家模型训练和测试")
-    parser.add_argument("--dataset", type=str, default="cifar10", help="数据集名称: cifar10, fashion_mnist, flickr8k")
-    parser.add_argument("--mode", type=str, default="train", help="运行模式: train, test")
-    parser.add_argument("--batch_size", type=int, default=128, help="批大小")
-    parser.add_argument("--num_epochs", type=int, default=10, help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=0.0005, help="学习率")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="权重衰减")
-    parser.add_argument("--checkpoint_path", type=str, default=None, help="检查点路径")
-    parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
-    parser.add_argument("--debug", action="store_true", help="是否启用调试模式")
-    
-    args = parser.parse_args()
-    main(args) 
+    main() 

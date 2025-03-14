@@ -225,42 +225,21 @@ class PatchEmbed(nn.Module):
         return x
 
 class AttentiveRouter(nn.Module):
-    """注意力路由器
-    
-    基于注意力机制的路由器，将输入分配给多个专家
-    """
+    """注意力路由器 - 只对一般专家进行路由选择"""
     def __init__(
         self,
         input_dim: int,
-        num_experts: int,
+        num_general_experts: int,  # 一般专家的数量
         top_k: int = 2,
-        capacity_factor: float = 1.5,
-        noisy_routing: bool = False,
-        use_softmax: bool = True,
         dropout: float = 0.1
     ):
-        """初始化
-        
-        Args:
-            input_dim: 输入维度
-            num_experts: 专家数量
-            top_k: 每个token选择的专家数量
-            capacity_factor: 容量因子
-            noisy_routing: 是否使用噪声路由
-            use_softmax: 是否使用softmax（否则使用sigmoid）
-            dropout: Dropout比率
-        """
         super().__init__()
         self.input_dim = input_dim
-        self.num_experts = num_experts
+        self.num_general_experts = num_general_experts
         self.top_k = top_k
-        self.capacity_factor = capacity_factor
-        self.noisy_routing = noisy_routing
-        self.use_softmax = use_softmax
-        self.noise_std = 0.01  # 噪声标准差
         
-        # 路由器 - 映射输入到专家选择
-        self.router = nn.Linear(input_dim, num_experts)
+        # 路由器只针对一般专家
+        self.router = nn.Linear(input_dim, num_general_experts)
         self.dropout = nn.Dropout(dropout)
         
         # 初始化
@@ -268,143 +247,93 @@ class AttentiveRouter(nn.Module):
     
     def reset_parameters(self):
         """重置参数，使用特殊初始化"""
-        # 使用正交初始化
         nn.init.orthogonal_(self.router.weight, gain=0.1)
-            
-    def forward(self, inputs: torch.Tensor) -> Dict[str, Any]:
-        """前向传播
-        
+    
+    def forward(self, inputs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
         Args:
-            inputs: 输入张量 [batch_size, seq_len, input_dim]
-            
+            inputs: [batch_size, seq_len, input_dim]
         Returns:
             包含路由决策的字典：
-                - logits: 路由逻辑 [batch_size, seq_len, num_experts]
-                - router_probs: 路由概率 [batch_size, seq_len, num_experts]
-                - expert_weights: 专家权重 [batch_size, seq_len, top_k]
-                - expert_indices: 专家索引 [batch_size, seq_len, top_k]
+            - expert_weights: [batch_size, seq_len, top_k]
+            - expert_indices: [batch_size, seq_len, top_k]
         """
-        # 确保输入张量是连续的
-        inputs = inputs.contiguous()
-        batch_size, seq_len, input_dim = inputs.shape
-        
-        # 计算路由logits: [batch_size, seq_len, num_experts]
+        # 计算一般专家的路由logits
         router_logits = self.router(inputs)
         
-        # 添加可选的训练噪声
-        if self.noisy_routing and self.training:
-            router_logits = router_logits + torch.randn_like(router_logits) * self.noise_std
+        # 计算路由概率
+        router_probs = F.softmax(router_logits, dim=-1)
         
-        # 计算每个token的top_k专家
-        if self.use_softmax:
-            # Softmax版本 - 使用softmax进行归一化
-            router_probs = F.softmax(router_logits, dim=-1)
-        else:
-            # Sigmoid版本 - 直接输出每个专家的重要性（可能值不是和为1）
-            router_probs = torch.sigmoid(router_logits)
-        
-        # 确保张量是连续的
-        router_probs = router_probs.contiguous()
-        
-        # 获取top_k专家及其权重
+        # 选择top-k个一般专家
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         
-        # 确保张量是连续的
-        top_k_probs = top_k_probs.contiguous()
-        top_k_indices = top_k_indices.contiguous()
-        
-        # 重新归一化top_k专家权重，使其和为1
-        if self.use_softmax:
-            # 对于softmax，直接除以sum即可
-            top_k_weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-        else:
-            # 对于sigmoid，使用softmax重新归一化
-            top_k_weights = F.softmax(top_k_probs, dim=-1)
+        # 重新归一化权重
+        top_k_weights = F.softmax(top_k_probs, dim=-1)
         
         return {
-            'logits': router_logits,              # [batch_size, seq_len, num_experts]
-            'router_probs': router_probs,         # [batch_size, seq_len, num_experts]
-            'expert_weights': top_k_weights,      # [batch_size, seq_len, top_k]
-            'expert_indices': top_k_indices       # [batch_size, seq_len, top_k]
+            'logits': router_logits,
+            'router_probs': router_probs,
+            'expert_weights': top_k_weights,
+            'expert_indices': top_k_indices
         }
 
 class UnifiedModalEncoder(nn.Module):
-    """统一的模态编码器"""
+    """MoE块 - 包含11个并行专家"""
     def __init__(
         self,
         embed_dim: int,
-        num_shared_experts: int,
-        num_modality_specific_experts: int,
-        top_k: int,
-        dropout: float,
-        num_heads: int,
+        num_general_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
         activation: str = 'gelu',
         layer_norm_eps: float = 1e-5,
-        use_bias: bool = True,
-        use_checkpoint: bool = False,
-        capacity_factor: float = 1.5
+        use_checkpoint: bool = False
     ):
-        """初始化
-        
-        Args:
-            embed_dim: 嵌入维度
-            num_shared_experts: 共享专家数量
-            num_modality_specific_experts: 模态特定专家数量
-            top_k: 每个token选择的专家数量
-            dropout: Dropout比率
-            num_heads: 注意力头数量
-            activation: 激活函数 ('gelu' 或 'relu')
-            layer_norm_eps: Layer Norm的epsilon值
-            use_bias: 是否使用偏置
-            use_checkpoint: 是否使用梯度检查点
-            capacity_factor: 专家容量因子，控制每个专家可处理的最大token数量
-        """
         super().__init__()
         
-        # 保存配置
-        self.embed_dim = embed_dim
-        self.num_shared_experts = num_shared_experts
-        self.num_modality_specific_experts = num_modality_specific_experts
-        self.num_experts = num_shared_experts + num_modality_specific_experts  # 添加总专家数量
-        self.top_k = top_k
-        self.dropout = dropout
-        self.num_heads = num_heads
-        self.activation = activation
-        self.layer_norm_eps = layer_norm_eps
-        self.use_bias = use_bias
-        self.use_checkpoint = use_checkpoint
-        self.capacity_factor = capacity_factor  # 保存capacity_factor
-        
-        # Layer Norm层
-        self.norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.norm2 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.norm3 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.cross_modal_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        
-        # 创建专家
-        # 共享专家 - 对所有token都可用
-        self.shared_experts = nn.ModuleList([
-            Expert(
+        # 1. 全局共享专家 - 处理所有token
+        self.global_expert = Expert(
                 n_embd=embed_dim,
                 expansion_factor=4,
                 dropout=dropout,
                 activation=activation
             )
-            for _ in range(num_shared_experts)
-        ])
         
-        # 模态特定专家 - 仅对特定模态token可用
-        self.modality_specific_experts = nn.ModuleList([
-            Expert(
+        # 2. 模态特定专家
+        self.vision_expert = Expert(
                 n_embd=embed_dim,
                 expansion_factor=4,
                 dropout=dropout,
                 activation=activation
             )
-            for _ in range(num_modality_specific_experts)
+        self.text_expert = Expert(
+            n_embd=embed_dim,
+            expansion_factor=4,
+            dropout=dropout,
+            activation=activation
+        )
+        
+        # 3. 一般专家
+        self.general_experts = nn.ModuleList([
+            Expert(
+                n_embd=embed_dim,
+                expansion_factor=4,
+            dropout=dropout,
+                activation=activation
+        )
+            for _ in range(num_general_experts)
         ])
         
-        # 注意力层
+        # 路由器 - 只针对一般专家
+        self.router = AttentiveRouter(
+            input_dim=embed_dim,
+            num_general_experts=num_general_experts,
+            top_k=top_k,
+            dropout=dropout
+        )
+        
+        # 自注意力层
         self.attention = nn.MultiheadAttention(
             embed_dim, 
             num_heads,
@@ -412,394 +341,329 @@ class UnifiedModalEncoder(nn.Module):
             batch_first=True
         )
         
+        # Layer Norm层
+        self.norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.norm2 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # 配置
+        self.use_checkpoint = use_checkpoint
+        self.top_k = top_k
+        self.num_general_experts = num_general_experts
+        
+    def forward(self, x: torch.Tensor, modality_type: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+        """前向传播
+        Args:
+            x: [batch_size, seq_len, embed_dim]
+            modality_type: [batch_size, seq_len] 0=图像, 1=文本, 0.5=融合层
+        """
+        # 如果未提供模态类型，默认为全0（图像）
+        if modality_type is None:
+            modality_type = torch.zeros(x.shape[0], x.shape[1], device=x.device)
+            
+        # 保存残差
+        residual = x
+        
+        # 1. 自注意力
+        x = self.norm1(x)
+        attn_output, attn_weights = self.attention(x, x, x)
+        x = residual + self.dropout(attn_output)
+        
+        # 保存残差
+        residual = x
+        
+        # 2. MoE层
+        x = self.norm2(x)
+        
+        # 初始化专家输出
+        batch_size, seq_len, embed_dim = x.shape
+        expert_outputs = torch.zeros_like(x)
+        
+        # 全局共享专家 - 处理所有token
+        global_output = self.global_expert(x)
+        expert_outputs += global_output
+        
+        # 模态特定专家 - 根据模态类型处理token
+        # 只有非融合层(即模态类型不为0.5)才使用模态特定专家
+        is_fusion_layer = (modality_type == 0.5).any()
+        
+        if not is_fusion_layer:
+            vision_mask = (modality_type == 0)
+            text_mask = (modality_type == 1)
+            
+            if vision_mask.any():
+                vision_tokens = x[vision_mask]
+                vision_output = self.vision_expert(vision_tokens)
+                expert_outputs[vision_mask] += vision_output
+                
+            if text_mask.any():
+                text_tokens = x[text_mask]
+                text_output = self.text_expert(text_tokens)
+                expert_outputs[text_mask] += text_output
+        
+        # 一般专家 - 通过路由选择处理token
+        router_outputs = self.router(x)
+        expert_indices = router_outputs['expert_indices']  # [batch_size, seq_len, top_k]
+        expert_weights = router_outputs['expert_weights']  # [batch_size, seq_len, top_k]
+        
+        # 处理每个token的top-k个专家
+        for k in range(self.top_k):
+            # 获取当前k位置的专家索引和权重
+            k_indices = expert_indices[:, :, k]  # [batch_size, seq_len]
+            k_weights = expert_weights[:, :, k].unsqueeze(-1)  # [batch_size, seq_len, 1]
+            
+            # 处理每个一般专家
+            for expert_idx in range(self.num_general_experts):
+                # 找到路由到当前专家的token
+                mask = (k_indices == expert_idx)
+                if mask.any():
+                    # 提取相关token
+                    tokens = x[mask]
+                    # 通过专家处理
+                    output = self.general_experts[expert_idx](tokens)
+                    # 加权累加到输出中
+                    expert_outputs[mask] += output * k_weights[mask]
+        
+        # 应用残差连接
+        x = residual + self.dropout(expert_outputs)
+        
+        return {
+            'output': x,
+            'router_logits': router_outputs.get('logits', None),
+            'router_probs': router_outputs.get('router_probs', None),
+            'attention_weights': attn_weights
+        }
+
+class ImageEncoder(nn.Module):
+    """图像MoE编码器 - 由6个MoE块组成"""
+    def __init__(
+        self,
+        embed_dim: int,
+        num_layers: int = 6,
+        num_general_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+        use_checkpoint: bool = False
+    ):
+        super().__init__()
+        
+        # 创建6个MoE块
+        self.layers = nn.ModuleList([
+            UnifiedModalEncoder(
+                embed_dim=embed_dim,
+                num_general_experts=num_general_experts,
+                top_k=top_k,
+                dropout=dropout,
+                num_heads=num_heads,
+                use_checkpoint=use_checkpoint
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # 最终Layer Norm
+        self.norm = nn.LayerNorm(embed_dim)
+        
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """前向传播
+        Args:
+            x: [batch_size, seq_len, embed_dim]
+        """
+        # 指定为图像模态
+        modality_type = torch.zeros(x.shape[0], x.shape[1], device=x.device)
+        
+        # 存储各层输出
+        layer_outputs = {}
+        
+        # 通过各层处理
+        for i, layer in enumerate(self.layers):
+            outputs = layer(x, modality_type)
+            x = outputs['output']
+            layer_outputs[f'layer_{i}'] = outputs
+        
+        # 最终归一化
+        x = self.norm(x)
+        
+        return {
+            'output': x,
+            'layer_outputs': layer_outputs
+        }
+
+class TextEncoder(nn.Module):
+    """文本MoE编码器 - 由4个MoE块组成"""
+    def __init__(
+        self,
+        embed_dim: int,
+        num_layers: int = 4,
+        num_general_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+        use_checkpoint: bool = False
+    ):
+        super().__init__()
+        
+        # 创建4个MoE块
+        self.layers = nn.ModuleList([
+            UnifiedModalEncoder(
+                embed_dim=embed_dim,
+                num_general_experts=num_general_experts,
+                top_k=top_k,
+                dropout=dropout,
+                num_heads=num_heads,
+                use_checkpoint=use_checkpoint
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # 最终Layer Norm
+        self.norm = nn.LayerNorm(embed_dim)
+        
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """前向传播
+        Args:
+            x: [batch_size, seq_len, embed_dim]
+        """
+        # 指定为文本模态
+        modality_type = torch.ones(x.shape[0], x.shape[1], device=x.device)
+        
+        # 存储各层输出
+        layer_outputs = {}
+        
+        # 通过各层处理
+        for i, layer in enumerate(self.layers):
+            outputs = layer(x, modality_type)
+            x = outputs['output']
+            layer_outputs[f'layer_{i}'] = outputs
+        
+        # 最终归一化
+        x = self.norm(x)
+        
+        return {
+            'output': x,
+            'layer_outputs': layer_outputs
+        }
+
+class CrossModalFusion(nn.Module):
+    """跨模态融合层 - 由3个MoE块组成"""
+    def __init__(
+        self,
+        embed_dim: int,
+        num_layers: int = 3,
+        num_general_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+        use_checkpoint: bool = False
+    ):
+        super().__init__()
+        
+        # 创建3个MoE块
+        self.layers = nn.ModuleList([
+            UnifiedModalEncoder(
+                embed_dim=embed_dim,
+                num_general_experts=num_general_experts,
+                top_k=top_k,
+                dropout=dropout,
+                num_heads=num_heads,
+                use_checkpoint=use_checkpoint
+            )
+            for _ in range(num_layers)
+        ])
+        
         # 跨模态注意力层
-        self.cross_modal_attention = nn.MultiheadAttention(
-            embed_dim,
-            num_heads,
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
             dropout=dropout,
             batch_first=True
         )
         
-        # 路由器 - 决定每个token使用哪些专家
-        self.router = AttentiveRouter(
-            input_dim=embed_dim,
-            num_experts=self.num_experts,
-            top_k=top_k,
-            dropout=dropout
-        )
-        
-        # 门控机制 - 用于控制跨模态融合
-        self.modal_gate = nn.Sequential(
+        # 门控机制
+        self.gate = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.Sigmoid()
         )
         
-        # Dropout层
-        self.dropout = nn.Dropout(dropout)
+        # Layer Norm
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
         
-        # 初始化权重
-        self._init_weights()
+        # 最终Layer Norm
+        self.norm = nn.LayerNorm(embed_dim)
         
-        # 初始化parent_model属性
-        self.parent_model = None
-        
-    def _init_weights(self):
-        """初始化模型权重"""
-        # 使用更通用的初始化方法，遍历所有模块
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                # 初始化线性层
-                nn.init.normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                # 初始化LayerNorm
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.MultiheadAttention):
-                # 初始化注意力层
-                if hasattr(module, 'in_proj_weight'):
-                    nn.init.normal_(module.in_proj_weight, std=0.02)
-                if hasattr(module, 'out_proj'):
-                    nn.init.normal_(module.out_proj.weight, std=0.02)
-                    nn.init.zeros_(module.out_proj.bias)
-        
-        # 初始化专家路由器
-        if hasattr(self, 'router'):
-            self.router.reset_parameters()
-        
-        # 初始化current_labels属性
-        self.current_labels = None
-        self.debug_cross_modal = False
-        
-    def _attention_block(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """自注意力块，用于处理序列信息
-        
-        Args:
-            x: 输入特征 [batch_size, seq_len, embed_dim]
-            
-        Returns:
-            tuple: (注意力输出, 注意力权重)
-        """
-        # 多头自注意力
-        attn_output, attn_weights = self.attention(
-            query=x,
-            key=x,
-            value=x
-        )
-        
-        return attn_output, attn_weights
-    
-    def _cross_modal_fusion(self, x: torch.Tensor, modal_context: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """跨模态融合层，用于整合不同模态的信息"""
-        if modal_context is None:
-            return x
-            
-        residual = x
-        x = self.cross_modal_norm(x)
-        
-        # 添加形状检查和调试信息
-        batch_size, seq_len, embed_dim = x.shape
-        modal_batch, modal_seq, modal_dim = modal_context.shape
-        
-        # 调试打印 - 仅在设置了debug标志时输出
-        if hasattr(self, 'debug_cross_modal') and self.debug_cross_modal:
-            print(f"\n[跨模态融合] 调试信息:")
-            print(f"  图像特征形状: {x.shape} - [批次大小, 序列长度, 嵌入维度]")
-            print(f"  文本特征形状: {modal_context.shape} - [批次大小, 序列长度, 嵌入维度]")
-            
-            # 打印modal_context的一些统计信息，帮助判断是否包含有效内容
-            if modal_context is not None:
-                modal_mean = modal_context.mean().item()
-                modal_std = modal_context.std().item()
-                modal_min = modal_context.min().item()
-                modal_max = modal_context.max().item()
-                print(f"  文本特征统计: 均值={modal_mean:.4f}, 标准差={modal_std:.4f}, 最小值={modal_min:.4f}, 最大值={modal_max:.4f}")
-        
-        # 确保维度匹配
-        if embed_dim != modal_dim:
-            raise ValueError(f"嵌入维度不匹配: x={embed_dim}, modal_context={modal_dim}")
-        
-        # 处理批次大小不匹配的情况
-        if modal_batch != batch_size:
-            error_msg = f"批次大小不匹配: 图像批次大小={batch_size}, 文本特征批次大小={modal_batch}"
-            if hasattr(self, 'current_labels'):
-                error_msg += f"\n当前标签: {self.current_labels if self.current_labels is not None else 'None'}"
-            error_msg += "\n解决方法:\n1. 确保文本特征的批次大小与图像批次大小相同\n2. 在调用forward前使用model.set_labels(labels)设置当前批次的标签"
-            raise ValueError(error_msg)
-        
-        # 使用注意力机制进行跨模态融合
-        try:
-            # 如果modal_context只有一个序列元素，尝试扩展它以匹配x的序列长度
-            if modal_seq == 1:
-                modal_context_expanded = modal_context.expand(modal_batch, seq_len, modal_dim)
-                fusion_output, _ = self.cross_modal_attention(x, modal_context_expanded, modal_context_expanded)
-                
-                # 打印调试信息
-                if hasattr(self, 'debug_cross_modal') and self.debug_cross_modal:
-                    print(f"  注意: 文本序列长度为1，已扩展到 {seq_len} 以匹配图像序列长度")
-            else:
-                fusion_output, _ = self.cross_modal_attention(x, modal_context, modal_context)
-                
-                # 打印调试信息
-                if hasattr(self, 'debug_cross_modal') and self.debug_cross_modal:
-                    print(f"  直接进行注意力融合，无需扩展文本特征")
-                    
-            # 打印融合输出的统计信息
-            if hasattr(self, 'debug_cross_modal') and self.debug_cross_modal:
-                fusion_mean = fusion_output.mean().item()
-                fusion_std = fusion_output.std().item()
-                print(f"  融合输出统计: 形状={fusion_output.shape}, 均值={fusion_mean:.4f}, 标准差={fusion_std:.4f}")
-                
-        except RuntimeError as e:
-            # 打印详细的形状信息以便调试
-            print(f"跨模态融合错误: x形状={x.shape}, modal_context形状={modal_context.shape}")
-            print(f"x数据类型={x.dtype}, modal_context数据类型={modal_context.dtype}")
-            print(f"x设备={x.device}, modal_context设备={modal_context.device}")
-            # 重新抛出异常
-            raise RuntimeError(f"跨模态融合失败: {str(e)}")
-        
-        # 使用门控机制控制融合程度
-        gate = self.modal_gate(fusion_output)
-        fusion_output = gate * fusion_output + (1 - gate) * residual
-        
-        # 打印门控值的统计信息
-        if hasattr(self, 'debug_cross_modal') and self.debug_cross_modal:
-            gate_mean = gate.mean().item()
-            gate_std = gate.std().item()
-            print(f"  门控值统计: 均值={gate_mean:.4f}, 标准差={gate_std:.4f}\n")
-            
-            # 打印完后关闭调试模式，以免输出过多日志
-            self.debug_cross_modal = False
-        
-        return fusion_output
-    
-    def _router_block(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mixture of Experts路由层
-        
-        Args:
-            x: 输入特征 [batch_size, seq_len, embed_dim]
-            
-        Returns:
-            tuple: (输出特征, 路由逻辑, 路由概率)
-        """
-        batch_size, seq_len, embed_dim = x.shape
-        total_tokens = batch_size * seq_len
-        
-        # 获取路由器输出字典
-        router_outputs = self.router(x)  # 返回字典
-        router_logits = router_outputs['logits']  # 提取logits
-        router_probs = router_outputs['router_probs']  # 提取概率
-        expert_weights = router_outputs['expert_weights']  # 提取专家权重
-        expert_indices = router_outputs['expert_indices']  # 提取专家索引
-        
-        # 确保张量在重塑之前是连续的
-        x = x.contiguous()
-        expert_weights = expert_weights.contiguous()
-        expert_indices = expert_indices.contiguous()
-        
-        # 展平所有维度以便处理
-        x_flat = x.reshape(-1, embed_dim)
-        expert_weights_flat = expert_weights.reshape(-1, self.top_k)
-        expert_indices_flat = expert_indices.reshape(-1, self.top_k)
-        
-        # 初始化输出
-        final_output = torch.zeros_like(x_flat)
-        capacity = int(total_tokens * self.capacity_factor)
-        
-        # 对每个专家分别处理
-        for expert_idx in range(self.num_experts):
-            # 找到选择了当前专家的所有token
-            expert_mask = (expert_indices_flat == expert_idx).any(dim=-1)
-            token_indices = torch.nonzero(expert_mask).squeeze(-1)
-            
-            # 如果没有token选择这个专家，跳过
-            if token_indices.numel() == 0:
-                continue
-                
-            # 获取这些token对应的权重
-            # 找到expert_idx在每个token的expert_indices中的位置
-            expert_pos = (expert_indices_flat == expert_idx).nonzero()[:, 1]
-            expert_probs = expert_weights_flat[token_indices, expert_pos]
-            
-            # 限制每个专家处理的token数量
-            if len(token_indices) > capacity:
-                # 只处理权重最高的tokens
-                _, top_capacity_indices = torch.topk(expert_probs, k=capacity)
-                token_indices = token_indices[top_capacity_indices]
-                expert_probs = expert_probs[top_capacity_indices]
-            
-            # 获取需要处理的输入
-            expert_inputs = x_flat[token_indices]
-            
-            # 通过专家处理
-            if expert_idx < len(self.shared_experts):
-                expert_output = self.shared_experts[expert_idx](expert_inputs)
-            else:
-                # 如果是模态特定专家
-                modal_expert_idx = expert_idx - len(self.shared_experts)
-                expert_output = self.modality_specific_experts[modal_expert_idx](expert_inputs)
-            
-            # 将专家输出加到最终输出中
-            final_output[token_indices] += expert_probs.unsqueeze(-1) * expert_output
-        
-        # 重塑回原始维度
-        final_output = final_output.reshape(batch_size, seq_len, embed_dim)
-        
-        return final_output, router_logits, router_probs
-
-    def forward(self, x: torch.Tensor, modal_context: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def forward(self, visual_features: torch.Tensor, text_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """前向传播
         Args:
-            x: 输入张量，形状为 [batch_size, seq_len, embed_dim]
-            modal_context: 可选的跨模态上下文，形状为 [batch_size, seq_len, embed_dim]
-            
-        Returns:
-            包含layer_output, router_logits和router_probs的字典
+            visual_features: [batch_size, vis_seq_len, embed_dim]
+            text_features: [batch_size, text_seq_len, embed_dim]
         """
-        # 传递current_labels属性（如果存在）
-        if hasattr(self, 'parent_model') and self.parent_model is not None:
-            if hasattr(self.parent_model, 'current_labels'):
-                self.current_labels = self.parent_model.current_labels
-            
-        # 使用对应的实现
-        if self.use_checkpoint and self.training:
-            return checkpoint.checkpoint(
-                self._forward_impl, 
-                x, modal_context
-            )
-        else:
-            return self._forward_impl(x, modal_context)
-    
-    def _forward_impl(self, x: torch.Tensor, modal_context: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """实际的前向传播实现
+        # 应用跨模态注意力
+        residual = visual_features
+        visual_features = self.norm1(visual_features)
         
-        Args:
-            x: 输入特征张量 [batch_size, seq_len, embed_dim]
-            modal_context: 可选的模态上下文特征 [batch_size, context_len, embed_dim]
-            
-        Returns:
-            包含层输出和路由信息的字典
-        """
-        # 保存输入以用于残差连接
-        residual = x
+        # 图像特征关注文本特征
+        cross_out, cross_weights = self.cross_attention(
+            query=visual_features, 
+            key=text_features, 
+            value=text_features
+        )
         
-        # 应用Layer Norm
-        x = self.norm1(x)
+        # 门控融合
+        gate_value = self.gate(cross_out)
+        fused_features = gate_value * cross_out + (1 - gate_value) * residual
         
-        # 1. 注意力块
-        attn_output, attention_weights = self._attention_block(x)
+        # 设置混合模态类型 (0.5表示混合模态)
+        batch_size, seq_len, embed_dim = fused_features.shape
+        modality_type = torch.ones(batch_size, seq_len, device=fused_features.device) * 0.5
         
-        # 应用残差连接
-        x = residual + self.dropout(attn_output)
+        # 存储各层输出
+        layer_outputs = {}
         
-        # 保存新的残差
-        residual = x
+        # 通过MoE块处理
+        x = fused_features
+        for i, layer in enumerate(self.layers):
+            outputs = layer(x, modality_type)
+            x = outputs['output']
+            layer_outputs[f'fusion_layer_{i}'] = outputs
         
-        # 2. 跨模态融合 - 应用Layer Norm
-        x = self.norm2(x)
+        # 最终归一化
+        x = self.norm(x)
         
-        # 应用跨模态融合
-        fusion_output = self._cross_modal_fusion(x, modal_context)
-        
-        # 应用残差连接
-        x = residual + self.dropout(fusion_output)
-        
-        # 保存新的残差
-        residual = x
-        
-        # 3. 路由块 - 应用Layer Norm
-        x = self.norm3(x)
-        
-        # 应用路由
-        moe_output, router_logits, router_probs = self._router_block(x)
-        
-        # 应用残差连接
-        x = residual + self.dropout(moe_output)
-        
-        # 创建返回字典
-        output_data = {
-            "layer_output": x,
-            "router_logits": router_logits,
-            "router_probs": router_probs,
-            "expert_mask": router_probs  # 为简单起见，直接使用router_probs
+        return {
+            'output': x,
+            'layer_outputs': layer_outputs,
+            'cross_attention_weights': cross_weights,
+            'gate_value': gate_value
         }
-        
-        # 可选地添加注意力权重
-        if attention_weights is not None:
-            output_data["attention_weights"] = attention_weights
-            
-        return output_data
 
 class MultiModalMoE(nn.Module):
-    """多模态混合专家模型"""
+    """多模态混合专家模型 - 完整架构"""
     def __init__(
         self,
-        img_size: int,          # 需要从dataset_info获取
-        patch_size: int,        # 需要从dataset_info获取
-        in_channels: int,       # 已从dataset_info获取
-        num_classes: int,       # 已从dataset_info获取
+        img_size: int,
+        patch_size: int,
+        in_channels: int,
+        num_classes: int,
         embed_dim: int = 512,
-        num_shared_experts: int = 8,
-        num_modality_specific_experts: int = 2,
+        num_general_experts: int = 8,
         top_k: int = 2,
         dropout: float = 0.1,
         num_heads: int = 8,
-        num_layers: int = 6,
-        activation: str = 'gelu',
-        layer_norm_eps: float = 1e-5,
-        initializer_range: float = 0.02,
-        use_gradient_checkpointing: bool = False,
-        vocab_size: int = 1000,
+        img_encoder_layers: int = 6,
+        text_encoder_layers: int = 4,
+        fusion_layers: int = 3,
+        device: str = 'cuda',
+        vocab_size: int = 50000,
         max_text_len: int = 32,
         text_embed_dim: int = 128,
-        text_descriptions: List[str] = None,
-        expert_type: str = 'resnet',
-        moe_layer: str = 'parallel',
-        use_gating: bool = True,
-        use_attention: bool = True,
-        device: str = None,
-        capacity_factor: float = 1.5
+        use_checkpoint: bool = False
     ):
-        """初始化多模态MoE模型
-        
-        Args:
-            img_size: 输入图像尺寸
-            patch_size: Patch大小
-            in_channels: 输入图像通道数
-            num_classes: 类别数
-            embed_dim: 嵌入维度
-            num_shared_experts: 共享专家数量
-            num_modality_specific_experts: 模态特定专家数量
-            top_k: 每个token选择的专家数量
-            dropout: Dropout比率
-            num_heads: 注意力头数量
-            num_layers: 层数
-            activation: 激活函数
-            layer_norm_eps: Layer Norm的epsilon
-            initializer_range: 初始化范围
-            use_gradient_checkpointing: 是否使用梯度检查点
-            vocab_size: 词汇表大小
-            max_text_len: 最大文本长度
-            text_embed_dim: 文本嵌入维度
-            text_descriptions: 文本描述列表
-            expert_type: 专家类型
-            moe_layer: MoE层类型
-            use_gating: 是否使用门控
-            use_attention: 是否使用注意力
-            device: 设备，如果为None则自动选择
-            capacity_factor: 专家容量因子
-        """
+        """初始化多模态MoE模型"""
         super().__init__()
         
-        # 自动选择设备
-        if device is None:
-            if torch.cuda.is_available():
-                device = 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = 'mps'
-            else:
-                device = 'cpu'
         self.device = device
         
         # 保存配置
@@ -809,19 +673,19 @@ class MultiModalMoE(nn.Module):
             'in_channels': in_channels,
             'num_classes': num_classes,
             'embed_dim': embed_dim,
-            'num_shared_experts': num_shared_experts,
-            'num_modality_specific_experts': num_modality_specific_experts,
+            'num_general_experts': num_general_experts,
             'top_k': top_k,
             'dropout': dropout,
             'num_heads': num_heads,
-            'num_layers': num_layers,
-            'activation': activation,
-            'layer_norm_eps': layer_norm_eps,
-            'initializer_range': initializer_range,
-            'use_gradient_checkpointing': use_gradient_checkpointing,
+            'img_encoder_layers': img_encoder_layers,
+            'text_encoder_layers': text_encoder_layers,
+            'fusion_layers': fusion_layers,
+            'device': device,
             'vocab_size': vocab_size,
             'max_text_len': max_text_len,
-            'text_embed_dim': text_embed_dim
+            'text_embed_dim': text_embed_dim,
+            'use_checkpoint': use_checkpoint,
+            'initializer_range': 0.02
         }
         
         # 图像Patch嵌入
@@ -835,76 +699,71 @@ class MultiModalMoE(nn.Module):
         # 计算patch序列长度
         self.seq_length = self.patch_embed.num_patches
         
-        # 位置嵌入 - 使用patch_embed计算的序列长度而不是手动计算
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_length, embed_dim))
+        # 图像位置嵌入
+        self.img_pos_embed = nn.Parameter(torch.zeros(1, self.seq_length, embed_dim))
         
         # 添加模态类型嵌入
-        self.token_type_embed = nn.Embedding(2, embed_dim)  # 0表示视觉token，1表示文本token
+        self.token_type_embed = nn.Embedding(2, embed_dim)  # 0=视觉, 1=文本
+        
+        # 文本嵌入层
+        self.text_embedding = nn.Embedding(vocab_size, text_embed_dim)
+        self.text_projection = nn.Linear(text_embed_dim, embed_dim)
+        
+        # 文本位置嵌入
+        max_pos_len = max(max_text_len, 77)
+        self.text_pos_embed = nn.Parameter(torch.zeros(1, max_pos_len, embed_dim))
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        # 是否使用CLS token
-        self.use_cls_token = False
-        
-        # 文本嵌入层（简化版）
-        self.text_embedding = nn.Embedding(vocab_size, text_embed_dim)
-        self.text_projection = nn.Linear(text_embed_dim, embed_dim)
-        
-        # 文本位置嵌入 - 使用max(max_text_len, 77)确保可以处理较长的文本
-        max_pos_len = max(max_text_len, 77)  # CLIP默认使用77，确保能处理较长的序列
-        self.text_pos_embed = nn.Parameter(torch.zeros(1, max_pos_len, embed_dim))
-        
-        # 在初始化各组件后添加进度提示
-        print("\n[模型初始化] 开始创建编码器层...")
-        self.layers = nn.ModuleList([
-            UnifiedModalEncoder(
+        # 图像编码器
+        self.image_encoder = ImageEncoder(
                 embed_dim=embed_dim,
-                num_shared_experts=num_shared_experts,
-                num_modality_specific_experts=num_modality_specific_experts,
+            num_layers=img_encoder_layers,
+            num_general_experts=num_general_experts,
                 top_k=top_k,
                 dropout=dropout,
                 num_heads=num_heads,
-                activation=activation,
-                layer_norm_eps=layer_norm_eps,
-                use_checkpoint=use_gradient_checkpointing,
-                capacity_factor=capacity_factor
-            )
-            for _ in range(num_layers)
-        ])
-        print("[模型初始化] 编码器层创建完成")
+            use_checkpoint=use_checkpoint
+        )
         
-        # 最终的Layer Norm
-        self.norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        # 文本编码器
+        self.text_encoder = TextEncoder(
+            embed_dim=embed_dim,
+            num_layers=text_encoder_layers,
+            num_general_experts=num_general_experts,
+            top_k=top_k,
+            dropout=dropout,
+            num_heads=num_heads,
+            use_checkpoint=use_checkpoint
+        )
         
-        print("初始化分类头...")
+        # 跨模态融合
+        self.cross_modal_fusion = CrossModalFusion(
+            embed_dim=embed_dim,
+            num_layers=fusion_layers,
+            num_general_experts=num_general_experts,
+            top_k=top_k,
+            dropout=dropout,
+            num_heads=num_heads,
+            use_checkpoint=use_checkpoint
+        )
+        
+        # 分类头
         self.classifier = nn.Linear(embed_dim, num_classes)
-        print("[模型初始化] 全部组件初始化完成")
-        
-        # 路由损失系数
-        self.router_z_loss = 0.001  # 抑制激活量
-        self.router_aux_loss = 0.01  # 负载平衡损失
         
         # 初始化
         self.apply(self._init_weights)
         
-        # 正则化位置编码
-        nn.init.trunc_normal_(self.pos_embed, std=initializer_range)
-        nn.init.trunc_normal_(self.text_pos_embed, std=initializer_range)
+        # 初始化位置编码
+        nn.init.trunc_normal_(self.img_pos_embed, std=self.config['initializer_range'])
+        nn.init.trunc_normal_(self.text_pos_embed, std=self.config['initializer_range'])
         
-        # 初始化当前批次的标签
-        self.current_labels = None
-        self.debug_forward = False  # 前向传播调试标志
-        
-        # 添加文本描述处理
-        self.text_descriptions = text_descriptions
-        
-        # 添加新参数到配置
-        self.expert_type = expert_type
-        self.moe_layer = moe_layer
-        self.use_gating = use_gating
-        self.use_attention = use_attention
-        self.capacity_factor = capacity_factor
+        # 损失函数权重
+        self.router_z_loss_weight = 0.001  # 路由器正则化损失权重
+        self.router_balance_loss_weight = 0.01  # 路由器平衡损失权重
+        self.cross_modal_alignment_weight = 0.1  # 跨模态对齐损失权重
+        self.contrastive_loss_weight = 0.1  # 对比损失权重
         
     def _init_weights(self, module):
         """初始化模型权重"""
@@ -917,32 +776,19 @@ class MultiModalMoE(nn.Module):
             module.weight.data.fill_(1.0)
     
     def interpolate_pos_encoding(self, x: torch.Tensor, pos_embed: torch.Tensor) -> torch.Tensor:
-        """对位置编码进行插值，使其适应不同大小的输入
-
-        Args:
-            x: 输入特征，形状为 [batch_size, num_patches, embed_dim]
-            pos_embed: 位置编码，形状为 [1, orig_num_patches, embed_dim]
-
-        Returns:
-            插值后的位置编码
-        """
-        # 获取当前序列长度（patch数量）和维度
+        """对位置编码进行插值，使其适应不同大小的输入"""
         _, seq_len, dim = x.shape
-        # 原始位置编码的序列长度
         _, orig_seq_len, _ = pos_embed.shape
         
-        # 如果序列长度相同，直接返回原始位置编码
         if seq_len == orig_seq_len:
             return pos_embed
             
-        # 计算原始图像的patch数量的平方根（假设是正方形图像）
         orig_size = int(math.sqrt(orig_seq_len))
-        # 计算新图像的patch数量的平方根
         new_size = int(math.sqrt(seq_len))
+        
         if orig_size == new_size:
             return pos_embed
             
-        # 调整位置编码以匹配新的序列长度
         pos_embed = pos_embed.reshape(1, orig_size, orig_size, dim).permute(0, 3, 1, 2)
         pos_embed = F.interpolate(
             pos_embed, 
@@ -953,215 +799,185 @@ class MultiModalMoE(nn.Module):
         pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, new_size * new_size, dim)
         return pos_embed
         
-    def forward(self, x: torch.Tensor, text_tokens=None, attention_mask=None, return_attention: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, 
+                images: torch.Tensor, 
+                text_tokens: Optional[torch.Tensor] = None, 
+                attention_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """前向传播
-        
         Args:
-            x: 输入图像张量，形状为 [batch_size, in_channels, height, width]
-            text_tokens: 可选的文本token，形状为 [batch_size, seq_len]
-            attention_mask: 可选的注意力mask，形状为 [batch_size, seq_len]
-            return_attention: 是否返回注意力权重
-            
-        Returns:
-            包含logits, embeddings和其他信息的字典
+            images: [batch_size, in_channels, height, width]
+            text_tokens: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
         """
-        device = x.device
-        fusion_outputs = {}  # 存储每一层的输出
+        batch_size = images.shape[0]
+        device = images.device
         
-        try:
-            # 检查输入数据的有效性
-            if not isinstance(x, torch.Tensor):
-                raise TypeError(f"输入x必须是torch.Tensor类型，但得到了{type(x)}")
-            
-            if x.dim() != 4:
-                raise ValueError(f"输入x必须是4维张量 [batch_size, channels, height, width]，但形状是{x.shape}")
-            
-            if x.size(1) != self.config['in_channels']:
-                raise ValueError(f"输入通道数必须是{self.config['in_channels']}，但得到了{x.size(1)}")
-            
-            if hasattr(self, 'debug_forward') and self.debug_forward:
-                # 简化调试输出，只打印关键信息
-                print(f"[MultiModalMoE Forward] 输入图像: 形状={x.shape}, 设备={x.device}")
-                if text_tokens is not None:
-                    print(f"文本输入: 形状={text_tokens.shape}, 设备={text_tokens.device}")
-            
-            # 设置patch_embed的调试标志 - 注释掉以避免级联调试输出
-            # if hasattr(self, 'patch_embed'):
-            #     self.patch_embed.debug_forward = self.debug_forward
-            
-            # 图像嵌入
-            x = self.patch_embed(x)
-            if hasattr(self, 'debug_forward') and self.debug_forward:
-                print(f"Patch嵌入后: 形状={x.shape}")
+        # 1. 处理图像输入
+        # 图像Patch嵌入
+        img_tokens = self.patch_embed(images)
             
             # 应用位置编码
-            if x.size(1) != self.pos_embed.size(1):
-                if hasattr(self, 'debug_forward') and self.debug_forward:
-                    print(f"需要插值位置编码: 序列长度={x.size(1)}, 位置编码长度={self.pos_embed.size(1)}")
-                pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
-            else:
-                pos_embed = self.pos_embed
+        if img_tokens.size(1) != self.img_pos_embed.size(1):
+            pos_embed = self.interpolate_pos_encoding(img_tokens, self.img_pos_embed)
+        else:
+            pos_embed = self.img_pos_embed
             
             # 确保位置编码在正确的设备上
             pos_embed = pos_embed.to(device)
             
             # 加上位置编码
-            x = x + pos_embed
-            if hasattr(self, 'debug_forward') and self.debug_forward:
-                print(f"添加位置编码后: 形状={x.shape}")
+        img_tokens = img_tokens + pos_embed
             
             # 添加类型编码（图像token为0）
-            token_type_ids = torch.zeros(x.size(0), x.size(1), dtype=torch.long, device=device)
-            x = x + self.token_type_embed(token_type_ids)
+        img_type_ids = torch.zeros(batch_size, img_tokens.size(1), dtype=torch.long, device=device)
+        img_tokens = img_tokens + self.token_type_embed(img_type_ids)
             
             # 应用dropout
-            x = self.dropout(x)
+        img_tokens = self.dropout(img_tokens)
             
-            # 处理文本输入
-            modal_context = None
-            if text_tokens is not None:
-                if hasattr(self, 'debug_forward') and self.debug_forward:
-                    print(f"处理文本输入: 形状={text_tokens.shape}")
-                
-                # 确保文本输入在正确的设备上
-                text_tokens = text_tokens.to(device)
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(device)
-                
-                # 文本嵌入
-                text_features = self.text_embedding(text_tokens)  # [batch_size, seq_len, text_embed_dim]
-                text_features = self.text_projection(text_features)  # [batch_size, seq_len, embed_dim]
-                
-                # 添加文本位置编码
-                text_pos_embed = self.text_pos_embed[:, :text_features.size(1), :].to(device)
-                text_features = text_features + text_pos_embed
-                
-                # 添加类型编码（文本token为1）
-                text_type_ids = torch.ones(text_features.size(0), text_features.size(1), dtype=torch.long, device=device)
-                text_features = text_features + self.token_type_embed(text_type_ids)
-                
-                # 应用dropout
-                text_features = self.dropout(text_features)
-                
-                if hasattr(self, 'debug_forward') and self.debug_forward:
-                    print(f"文本特征形状: {text_features.shape}")
-                    print(f"文本特征数据范围: [{text_features.min().item():.4f}, {text_features.max().item():.4f}]")
-                    print(f"文本特征类型: {text_features.dtype}")
-                    print(f"文本特征设备: {text_features.device}")
-                
-                # 设置为模态上下文
-                modal_context = text_features
-            
-            # 遍历编码器层
-            for layer_idx, layer in enumerate(self.layers):
-                if hasattr(self, 'debug_forward') and self.debug_forward:
-                    print(f"\n处理编码器层 {layer_idx + 1}/{len(self.layers)}:")
-                    print(f"输入形状: {x.shape}")
-                    print(f"输入数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
-                    print(f"输入数据类型: {x.dtype}")
-                    print(f"输入设备: {x.device}")
-                
-                # 应用编码器层
-                layer_outputs = layer(x, modal_context)
-                x = layer_outputs['layer_output']
-                
-                if hasattr(self, 'debug_forward') and self.debug_forward:
-                    print(f"层输出形状: {x.shape}")
-                    print(f"层输出数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
-                    print(f"层输出类型: {x.dtype}")
-                    print(f"层输出设备: {x.device}")
-                    if 'router_probs' in layer_outputs:
-                        router_probs = layer_outputs['router_probs']
-                        print(f"路由概率形状: {router_probs.shape}")
-                        print(f"路由概率范围: [{router_probs.min().item():.4f}, {router_probs.max().item():.4f}]")
-                        print(f"路由概率类型: {router_probs.dtype}")
-                        print(f"路由概率设备: {router_probs.device}")
-                
-                # 存储该层的输出
-                fusion_outputs[f'layer_{layer_idx}'] = {
-                    'router_logits': layer_outputs.get('router_logits', None),
-                    'router_probs': layer_outputs.get('router_probs', None),
-                    'expert_mask': layer_outputs.get('expert_mask', None),
-                    'layer_output': layer_outputs['layer_output']
-                }
-                
-                if return_attention and 'attention_weights' in layer_outputs:
-                    fusion_outputs[f'layer_{layer_idx}']['attention_weights'] = layer_outputs['attention_weights']
-            
-            # 应用最终的Layer Norm
-            x = self.norm(x)
-            
-            # 取[CLS] token或平均池化
-            if self.use_cls_token:
-                x = x[:, 0]
-            else:
-                x = x.mean(dim=1)
-            
-            if hasattr(self, 'debug_forward') and self.debug_forward:
-                print(f"\n最终特征:")
-                print(f"池化后形状: {x.shape}")
-                print(f"特征数据范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
-                print(f"特征类型: {x.dtype}")
-                print(f"特征设备: {x.device}")
-            
-            # 应用分类头
-            logits = self.classifier(x)
-            
-            if hasattr(self, 'debug_forward') and self.debug_forward:
-                print(f"\n分类输出:")
-                print(f"Logits形状: {logits.shape}")
-                print(f"Logits数据范围: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
-                print(f"Logits类型: {logits.dtype}")
-                print(f"Logits设备: {logits.device}")
-            
-            # 计算路由损失
-            router_loss = torch.tensor(0.0, device=device)
-            for layer_idx in range(len(self.layers)):
-                layer_outputs = fusion_outputs[f'layer_{layer_idx}']
-                if 'router_logits' in layer_outputs and 'router_probs' in layer_outputs:
-                    router_loss = router_loss + self.router_z_loss * self.compute_z_loss(layer_outputs['router_logits'])
-                    router_loss = router_loss + self.router_aux_loss * self.compute_load_loss(layer_outputs['router_probs'])
-            
-            # 构建返回字典
-            outputs = {
-                'logits': logits,
-                'embeddings': x,
-                'router_loss': router_loss
-            }
-            
-            if return_attention:
-                outputs['fusion_outputs'] = fusion_outputs
-            
-            return outputs
-            
-        except Exception as e:
-            print(f"\n[MultiModalMoE Forward] 错误:")
-            print(f"错误类型: {type(e).__name__}")
-            print(f"错误信息: {str(e)}")
-            print("\n输入状态:")
-            print(f"x形状: {x.shape if isinstance(x, torch.Tensor) else 'Not a tensor'}")
-            print(f"x类型: {type(x)}")
-            if isinstance(x, torch.Tensor):
-                print(f"x设备: {x.device}")
-                print(f"x数据类型: {x.dtype}")
-            if text_tokens is not None:
-                print(f"text_tokens形状: {text_tokens.shape if isinstance(text_tokens, torch.Tensor) else 'Not a tensor'}")
+        # 2. 处理文本输入
+        text_tokens_processed = None
+        text_features = None
+        if text_tokens is not None:
+            # 确保文本输入在正确的设备上
+            text_tokens = text_tokens.to(device)
             if attention_mask is not None:
-                print(f"attention_mask形状: {attention_mask.shape if isinstance(attention_mask, torch.Tensor) else 'Not a tensor'}")
-            import traceback
-            print("\n完整的错误追踪:")
-            print(traceback.format_exc())
-            raise
-
+                attention_mask = attention_mask.to(device)
+                
+            # 文本嵌入
+            text_features = self.text_embedding(text_tokens)
+            text_features = self.text_projection(text_features)
+                
+            # 添加文本位置编码
+            text_pos_embed = self.text_pos_embed[:, :text_features.size(1), :].to(device)
+            text_features = text_features + text_pos_embed
+                
+            # 添加类型编码（文本token为1）
+            text_type_ids = torch.ones(batch_size, text_features.size(1), dtype=torch.long, device=device)
+            text_features = text_features + self.token_type_embed(text_type_ids)
+                
+            # 应用dropout
+            text_tokens_processed = self.dropout(text_features)
+        
+        # 3. 通过编码器处理图像和文本
+        img_encoder_outputs = self.image_encoder(img_tokens)
+        img_features = img_encoder_outputs['output']
+        
+        # 如果有文本输入，处理文本并进行跨模态融合
+        fusion_outputs = {}
+        if text_tokens_processed is not None:
+            text_encoder_outputs = self.text_encoder(text_tokens_processed)
+            text_features = text_encoder_outputs['output']
+            
+            # 跨模态融合
+            fusion_outputs = self.cross_modal_fusion(img_features, text_features)
+            final_features = fusion_outputs['output']
+        else:
+            # 如果没有文本输入，只使用图像特征
+            final_features = img_features
+            fusion_outputs = {'output': final_features}
+        
+        # 4. 全局池化 - 平均池化
+        pooled_features = final_features.mean(dim=1)
+        
+        # 5. 分类
+        logits = self.classifier(pooled_features)
+        
+        # 收集所有层的路由决策，用于计算路由损失
+        all_router_logits = []
+        all_router_probs = []
+        
+        # 收集图像编码器路由决策
+        for i in range(self.config['img_encoder_layers']):
+            layer_outputs = img_encoder_outputs['layer_outputs'][f'layer_{i}']
+            if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
+                all_router_logits.append(layer_outputs['router_logits'])
+            if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
+                all_router_probs.append(layer_outputs['router_probs'])
+        
+        # 如果有文本输入，收集文本编码器和融合层路由决策
+        if text_tokens_processed is not None:
+            # 文本编码器路由决策
+            for i in range(self.config['text_encoder_layers']):
+                layer_outputs = text_encoder_outputs['layer_outputs'][f'layer_{i}']
+                if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
+                    all_router_logits.append(layer_outputs['router_logits'])
+                if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
+                    all_router_probs.append(layer_outputs['router_probs'])
+            
+            # 融合层路由决策
+            for i in range(self.config['fusion_layers']):
+                layer_outputs = fusion_outputs['layer_outputs'][f'fusion_layer_{i}']
+                if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
+                    all_router_logits.append(layer_outputs['router_logits'])
+                if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
+                    all_router_probs.append(layer_outputs['router_probs'])
+        
+        # 计算路由损失
+        router_z_loss = torch.tensor(0.0, device=device)
+        router_balance_loss = torch.tensor(0.0, device=device)
+        
+        for router_logits in all_router_logits:
+            router_z_loss = router_z_loss + self.compute_z_loss(router_logits)
+            
+        for router_probs in all_router_probs:
+            router_balance_loss = router_balance_loss + self.compute_load_loss(router_probs)
+        
+        # 计算跨模态对齐损失
+        cross_modal_loss = torch.tensor(0.0, device=device)
+        contrastive_loss = torch.tensor(0.0, device=device)
+        if text_tokens_processed is not None:
+            # 简单的余弦相似度损失
+            img_mean = img_features.mean(dim=1)
+            text_mean = text_features.mean(dim=1)
+            
+            img_norm = F.normalize(img_mean, p=2, dim=1)
+            text_norm = F.normalize(text_mean, p=2, dim=1)
+            
+            # 最大化余弦相似度（最小化负相似度）
+            cross_modal_loss = -torch.sum(img_norm * text_norm) / batch_size
+            
+            # 计算对比损失
+            # 计算所有样本对之间的相似度矩阵
+            similarity_matrix = torch.matmul(img_norm, text_norm.transpose(0, 1))
+            
+            # 正样本对（对角线）和负样本对
+            labels = torch.arange(batch_size, device=device)
+            
+            # 计算对比损失（InfoNCE损失）
+            contrastive_loss_i2t = F.cross_entropy(similarity_matrix / 0.07, labels)
+            contrastive_loss_t2i = F.cross_entropy(similarity_matrix.t() / 0.07, labels)
+            contrastive_loss = (contrastive_loss_i2t + contrastive_loss_t2i) / 2.0
+        
+        # 总路由损失
+        router_loss = (
+            self.router_z_loss_weight * router_z_loss + 
+            self.router_balance_loss_weight * router_balance_loss +
+            self.cross_modal_alignment_weight * cross_modal_loss +
+            self.contrastive_loss_weight * contrastive_loss
+        )
+        
+        return {
+            'logits': logits,
+            'embeddings': pooled_features,
+            'img_features': img_features,
+            'text_features': text_features if text_tokens_processed is not None else None,
+            'fused_features': final_features,
+            'router_z_loss': router_z_loss,
+            'router_balance_loss': router_balance_loss,
+            'cross_modal_loss': cross_modal_loss,
+            'contrastive_loss': contrastive_loss,
+            'router_loss': router_loss,
+            # 存储专家激活情况，用于可视化
+            'expert_activations': {
+                'img_encoder': img_encoder_outputs.get('layer_outputs', {}),
+                'text_encoder': text_encoder_outputs.get('layer_outputs', {}) if text_tokens_processed is not None else {},
+                'fusion': fusion_outputs.get('layer_outputs', {}) if text_tokens_processed is not None else {}
+            }
+        }
+    
     def compute_z_loss(self, router_logits: torch.Tensor) -> torch.Tensor:
-        """计算z损失来正则化路由逻辑
-
-        Args:
-            router_logits: 路由逻辑，形状为 [batch_size, seq_len, num_experts]
-
-        Returns:
-            z损失值
-        """
+        """计算z损失来正则化路由逻辑"""
         # 计算每个专家的平均路由概率
         router_probs = torch.softmax(router_logits, dim=-1)
         # 计算router_z的平方（用于正则化）
@@ -1170,49 +986,19 @@ class MultiModalMoE(nn.Module):
         return router_z
 
     def compute_load_loss(self, router_probs: torch.Tensor) -> torch.Tensor:
-        """计算负载平衡损失，以确保专家的使用均衡
-
-        Args:
-            router_probs: 路由概率，形状为 [batch_size, seq_len, num_experts]
-
-        Returns:
-            负载平衡损失值
-        """
-        # 获取批量大小、序列长度和专家数量
-        batch_size, seq_len, num_experts = router_probs.shape
+        """计算负载平衡损失，以确保专家的使用均衡"""
+        # 获取专家数量
+        num_experts = router_probs.shape[-1]
         
         # 计算每个专家的使用频率
-        # 对于每个token，计算其路由到每个专家的概率
         expert_usage = router_probs.mean(dim=(0, 1))
         
-        # 计算理想的均匀分布（每个专家应该接收相同比例的token）
+        # 计算理想的均匀分布
         ideal_usage = torch.ones_like(expert_usage) / num_experts
         
         # 使用KL散度计算与理想分布的差异
-        load_loss = torch.sum(expert_usage * torch.log(expert_usage / ideal_usage))
+        load_loss = torch.sum(expert_usage * torch.log(expert_usage / ideal_usage + 1e-9))
         return load_loss
-
-    def set_labels(self, labels: torch.Tensor):
-        """设置当前批次的标签，用于文本特征的匹配
-        
-        参数:
-            labels: 形状为 [batch_size] 的张量，包含当前批次每个样本的类别标签
-        """
-        self.current_labels = labels
-        return self
-    
-    def enable_debug(self, enable: bool = True):
-        """启用或禁用调试模式
-        
-        参数:
-            enable: 是否启用调试模式
-        """
-        self.debug_forward = enable
-        # 同时为所有编码器层设置调试标志
-        for layer in self.layers:
-            if hasattr(layer, 'debug_cross_modal'):
-                layer.debug_cross_modal = enable
-        return self
 
 class ModelWrapper(nn.Module):
     """统一模型接口"""
@@ -1220,6 +1006,10 @@ class ModelWrapper(nn.Module):
         super().__init__()
         self.model = model
         self.preprocess = preprocess
+        
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> Dict[str, Any]:
+        """前向传播函数"""
+        return self.model(x, *args, **kwargs)
         
     @torch.inference_mode()
     def predict(self, inputs: Union[np.ndarray, List[Image.Image]]) -> Dict[str, Any]:

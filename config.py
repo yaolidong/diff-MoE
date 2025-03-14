@@ -123,9 +123,9 @@ class Flickr8kConfig(DatasetConfig):
 class TrainingConfig:
     """训练配置"""
     # 基本训练参数
-    num_epochs: int = 10
-    batch_size: int = 128
-    learning_rate: float = 0.0005
+    num_epochs: int = 2  # 改为10轮
+    batch_size: int = 128  # 改为64
+    learning_rate: float = 0.001  # 初始学习率设为0.001
     weight_decay: float = 0.01
     
     # 检查点配置
@@ -140,27 +140,50 @@ class TrainingConfig:
 
 @dataclass
 class ModelConfig:
-    """模型配置"""
+    """模型配置类"""
     def __init__(self):
         # 基础参数
-        self.embed_dim = 768  # 嵌入维度
-        self.num_heads = 12  # 注意力头数
-        self.num_layers = 12  # Transformer层数
-        self.dropout = 0.1  # Dropout率
-        self.vocab_size = 49408  # 词汇表大小，匹配CLIP tokenizer
+        self.embed_dim = 512
+        self.num_heads = 8
+        self.num_layers = 6
+        self.dropout = 0.1
+        self.vocab_size = 49508
         
-        # MoE相关参数
-        self.num_shared_experts = 4  # 共享专家数量
-        self.num_modality_specific_experts = 2  # 每个模态的专家数量
-        self.top_k = 2  # 每个样本选择的专家数量
-        self.capacity_factor = 1.5  # 专家容量因子
+        # 训练参数
+        self.batch_size = 32
+        self.learning_rate = 1e-4
+        self.weight_decay = 0.01
+        self.warmup_steps = 1000
+        self.max_epochs = 100
+        self.early_stopping_patience = 10
         
-        # 激活函数和归一化
-        self.activation = 'gelu'
-        self.layer_norm_eps = 1e-5
+        # 优化器参数
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.eps = 1e-8
         
-        # 初始化参数
-        self.initializer_range = 0.02
+        # 梯度检查点
+        self.use_checkpoint = False
+        
+        # 损失函数权重
+        self.ce_loss_weight = 1.0
+        self.aux_loss_weight = 0.1
+        
+        # 数据增强
+        self.use_augmentation = True
+        self.mixup_alpha = 0.2
+        self.cutmix_alpha = 1.0
+        
+        # 设备配置
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.num_workers = 4
+        
+        # 日志和保存
+        self.log_interval = 100
+        self.save_interval = 1000
+        self.eval_interval = 1000
+        self.save_dir = 'checkpoints'
+        self.log_dir = 'logs'
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
