@@ -22,137 +22,123 @@ def setup_environment():
         device = torch.device('cpu')
     return device
 
-def evaluate(model, data_loader, device, criterion=None, class_names=None, class_descriptions=None) -> Dict[str, Any]:
-    """评估模型性能
+import torch.nn.functional as F # Added import
+
+def evaluate(model, data_loader, device) -> Dict[str, Any]: # Removed criterion, class_names, class_descriptions
+    """评估模型性能 (for KG Alignment Task)
     
     Args:
         model: 要评估的模型
-        data_loader: 数据加载器
+        data_loader: 数据加载器 (expected to yield KGAlignmentDataset batches)
         device: 运行设备
-        criterion: 损失函数（可选）
-        class_names: 类别名称列表（可选）
-        class_descriptions: 类别描述字典（可选）
         
     Returns:
-        包含评估指标的字典
+        包含评估指标的字典 (loss, hits@1, hits@5, hits@10, mrr)
     """
     model.eval()
-    if criterion is None:
-        criterion = nn.CrossEntropyLoss()
         
-    all_labels = []
-    all_predictions = []
-    total_loss = 0
-    total_router_loss = 0
-    total_contrastive_loss = 0
-    valid_batches = 0
+    total_eval_loss = 0.0
+    total_router_loss_eval = 0.0 # Accumulator for router loss during evaluation
+    total_alignment_loss_eval = 0.0 # Accumulator for alignment loss during evaluation
+
+    total_hits_at_1 = 0
+    total_hits_at_5 = 0
+    total_hits_at_10 = 0
+    total_mrr = 0.0
+    num_samples = 0
     
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="评估中"):
             try:
-                # 数据加载和预处理
-                if isinstance(batch, (list, tuple)) and len(batch) == 4:  # TextEnhancedDataset输出
-                    images, input_ids, attention_mask, labels = batch
-                    images = images.to(device)
-                    input_ids = input_ids.to(device)
-                    attention_mask = attention_mask.to(device)
-                    labels = labels.to(device)
-                    
-                    outputs = model(images, text_tokens=input_ids, attention_mask=attention_mask)
-                elif isinstance(batch, (list, tuple)) and len(batch) == 3:  # Flickr8k输出
-                    images, captions, labels = batch
-                    images = images.to(device)
-                    labels = labels.to(device)
-                    
-                    if isinstance(captions, torch.Tensor) and captions.dim() == 2:
-                        # 已经是token化的文本
-                        text_tokens = captions.to(device)
-                        attention_mask = torch.ones_like(text_tokens).to(device)
-                        outputs = model(images, text_tokens=text_tokens, attention_mask=attention_mask)
-                    else:
-                        # 原始文本，需要进行处理
-                        # 这里暂不实现，跳过此批次
-                        print("警告：收到未处理的文本数据，跳过批次")
-                        continue
-                else:  # 标准数据集输出
-                    images, labels = batch
-                    images = images.to(device)
-                    labels = labels.to(device)
-                    
-                    outputs = model(images)
+                if not (isinstance(batch, (list, tuple)) and len(batch) == 7):
+                    print(f"Warning: Skipping batch of unexpected format in evaluate. Expected 7 items, got {len(batch)}.")
+                    continue
+
+                images1, input_ids1, attention_mask1, \
+                images2, input_ids2, attention_mask2, _ = batch # true_labels not used for these metrics
+
+                images1 = images1.to(device)
+                input_ids1 = input_ids1.to(device) if input_ids1 is not None else None
+                attention_mask1 = attention_mask1.to(device) if attention_mask1 is not None else None
+                images2 = images2.to(device)
+                input_ids2 = input_ids2.to(device) if input_ids2 is not None else None
+                attention_mask2 = attention_mask2.to(device) if attention_mask2 is not None else None
                 
-                # 计算损失和预测
-                logits = outputs['logits']
-                router_loss = outputs.get('router_loss', 0)
-                contrastive_loss = outputs.get('contrastive_loss', 0)
-                loss = criterion(logits, labels) + router_loss
+                outputs = model(images1, input_ids1, attention_mask1,
+                                images2, input_ids2, attention_mask2)
                 
-                _, predicted = torch.max(logits.data, 1)
+                embedding1 = outputs['embedding1']
+                embedding2 = outputs['embedding2']
+                router_loss = outputs.get('router_loss', torch.tensor(0.0, device=device))
+
+                # Alignment Loss Calculation
+                embedding1_norm = F.normalize(embedding1, p=2, dim=1)
+                embedding2_norm = F.normalize(embedding2, p=2, dim=1)
                 
-                # 收集结果
-                all_predictions.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                total_loss += loss.item()
-                if isinstance(router_loss, torch.Tensor):
-                    total_router_loss += router_loss.item()
+                batch_size = embedding1_norm.size(0)
+
+                margin = 0.2 # Default margin
+                if hasattr(data_loader.dataset, 'config') and hasattr(data_loader.dataset.config, 'alignment_margin'):
+                    margin = data_loader.dataset.config.alignment_margin
+
+                sim_matrix = torch.matmul(embedding1_norm, embedding2_norm.t())
+
+                batch_alignment_loss = torch.tensor(0.0, device=device)
+                for i in range(batch_size):
+                    positive_sim = sim_matrix[i, i]
+                    
+                    negative_sim_e1_vs_e2 = torch.cat((sim_matrix[i, :i], sim_matrix[i, i+1:]))
+                    batch_alignment_loss += torch.sum(F.relu(-positive_sim + negative_sim_e1_vs_e2 + margin))
+                    
+                    negative_sim_e2_vs_e1 = torch.cat((sim_matrix[:i, i], sim_matrix[i+1:, i]))
+                    batch_alignment_loss += torch.sum(F.relu(-positive_sim + negative_sim_e2_vs_e1 + margin))
+                
+                if batch_size > 0:
+                    batch_alignment_loss = batch_alignment_loss / (2 * batch_size)
                 else:
-                    total_router_loss += router_loss
-                    
-                if isinstance(contrastive_loss, torch.Tensor):
-                    total_contrastive_loss += contrastive_loss.item()
-                else:
-                    total_contrastive_loss += contrastive_loss
-                    
-                valid_batches += 1
-                
+                    batch_alignment_loss = torch.tensor(0.0, device=device)
+
+                total_alignment_loss_eval += batch_alignment_loss.item()
+                total_router_loss_eval += router_loss.item()
+                total_eval_loss += (batch_alignment_loss + router_loss).item()
+
+                # Ranking Metrics (Hits@k, MRR) - In-batch
+                # For e1_i vs e2_j (ranking e2s for each e1)
+                for i in range(batch_size):
+                    similarities_for_e1_i = sim_matrix[i, :]
+                    sorted_indices = torch.argsort(similarities_for_e1_i, descending=True)
+
+                    rank = (sorted_indices == i).nonzero(as_tuple=True)[0].item() + 1
+
+                    if rank <= 1:
+                        total_hits_at_1 += 1
+                    if rank <= 5:
+                        total_hits_at_5 += 1
+                    if rank <= 10:
+                        total_hits_at_10 += 1
+                    total_mrr += 1.0 / rank
+                num_samples += batch_size # Each e1 is a sample for ranking e2s
+
             except Exception as e:
-                print(f"处理批次时出错: {str(e)}")
+                print(f"处理评估批次时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 continue
     
-    # 计算指标
-    all_predictions = np.array(all_predictions)
-    all_labels = np.array(all_labels)
+    avg_eval_loss = total_eval_loss / len(data_loader) if len(data_loader) > 0 else float('inf')
+    avg_hits_at_1 = total_hits_at_1 / num_samples if num_samples > 0 else 0.0
+    avg_hits_at_5 = total_hits_at_5 / num_samples if num_samples > 0 else 0.0
+    avg_hits_at_10 = total_hits_at_10 / num_samples if num_samples > 0 else 0.0
+    avg_mrr = total_mrr / num_samples if num_samples > 0 else 0.0
     
-    # 计算整体准确率
-    correct = (all_predictions == all_labels).sum()
-    total = len(all_labels)
-    accuracy = 100 * correct / total
-    
-    # 计算每个类别的准确率
-    class_accuracies = {}
-    if class_names:
-        for i, name in enumerate(class_names):
-            class_indices = (all_labels == i)
-            if np.sum(class_indices) > 0:
-                class_correct = np.sum((all_predictions[class_indices] == i))
-                class_accuracy = 100 * class_correct / np.sum(class_indices)
-                class_accuracies[name] = class_accuracy
-    
-    # 计算其他指标
-    average = 'micro' if len(set(all_labels)) > 2 else 'binary'
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_predictions, average=average, zero_division=0
-    )
-    
-    # 计算混淆矩阵
-    if class_names:
-        cm = confusion_matrix(all_labels, all_predictions)
-    else:
-        cm = None
-    
-    # 返回结果
     results = {
-        'accuracy': accuracy,
-        'loss': total_loss / valid_batches if valid_batches > 0 else float('inf'),
-        'router_loss': total_router_loss / valid_batches if valid_batches > 0 else 0,
-        'contrastive_loss': total_contrastive_loss / valid_batches if valid_batches > 0 else 0,
-        'class_accuracy': class_accuracies,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'predictions': all_predictions,
-        'labels': all_labels,
-        'confusion_matrix': cm
+        'loss': avg_eval_loss,
+        'hits@1': avg_hits_at_1,
+        'hits@5': avg_hits_at_5,
+        'hits@10': avg_hits_at_10,
+        'mrr': avg_mrr,
+        'router_loss_eval': total_router_loss_eval / len(data_loader) if len(data_loader) > 0 else 0.0,
+        'alignment_loss_eval': total_alignment_loss_eval / len(data_loader) if len(data_loader) > 0 else 0.0
     }
     
     return results

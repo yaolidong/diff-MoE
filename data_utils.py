@@ -355,6 +355,120 @@ def download_fashion_mnist(download_dir: str) -> str:
     except Exception as e:
         return ""
 
+def load_alignment_pairs(file_path: str) -> List[Tuple[str, str]]:
+    """
+    加载对齐实体对
+
+    Args:
+        file_path: 文件路径，每行包含两个由制表符分隔的实体URI/ID
+
+    Returns:
+        List[Tuple[str, str]]: 实体对列表
+
+    Raises:
+        FileNotFoundError: 如果文件未找到
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Alignment file not found: {file_path}")
+
+    alignment_pairs = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                # 跳过空行
+                continue
+
+            parts = line.split('\t')
+            if len(parts) == 2:
+                alignment_pairs.append((parts[0].strip(), parts[1].strip()))
+            else:
+                print(f"Warning: Skipping malformed line {i+1} in {file_path}: '{line}'")
+
+    return alignment_pairs
+
+def load_entity_text_attributes(file_path: str) -> Dict[str, str]:
+    """
+    加载实体文本属性
+
+    Args:
+        file_path: 文件路径，每行包含一个实体URI/ID和其文本描述，由制表符分隔
+
+    Returns:
+        Dict[str, str]: 实体ID到文本描述的映射
+
+    Raises:
+        FileNotFoundError: 如果文件未找到
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Entity text attribute file not found: {file_path}")
+
+    entity_attributes = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                # 跳过空行
+                continue
+
+            parts = line.split('\t', 1) # 最多分割一次，以允许描述中包含制表符
+            if len(parts) == 2:
+                entity_id = parts[0].strip()
+                description = parts[1].strip()
+                if entity_id in entity_attributes:
+                    print(f"Warning: Duplicate entity ID '{entity_id}' in {file_path}. Overwriting previous entry.")
+                entity_attributes[entity_id] = description
+            else:
+                print(f"Warning: Skipping malformed line {i+1} in {file_path}: '{line}'")
+
+    return entity_attributes
+
+def load_entity_image_paths(img_dir: str, entity_ids: Optional[List[str]] = None) -> Dict[str, str]:
+    """
+    加载实体图像路径
+
+    Args:
+        img_dir: 包含图像文件的目录
+        entity_ids: 可选的实体ID列表。如果提供，则只查找这些实体的图像。
+                    否则，扫描目录中的所有图像。
+
+    Returns:
+        Dict[str, str]: 实体ID到其图像文件路径的映射
+
+    Raises:
+        FileNotFoundError: 如果img_dir不存在
+    """
+    if not os.path.isdir(img_dir):
+        raise FileNotFoundError(f"Image directory not found: {img_dir}")
+
+    entity_image_paths = {}
+    supported_extensions = ['.jpg', '.jpeg', '.png']
+
+    if entity_ids:
+        for entity_id in entity_ids:
+            found_img = False
+            for ext in supported_extensions:
+                img_filename = f"{entity_id}{ext}"
+                img_path = os.path.join(img_dir, img_filename)
+                if os.path.exists(img_path):
+                    entity_image_paths[entity_id] = img_path
+                    found_img = True
+                    break  # 找到一个即可
+            if not found_img:
+                print(f"Warning: Image not found for entity ID '{entity_id}' in {img_dir}")
+    else:
+        for filename in os.listdir(img_dir):
+            name_part, ext = os.path.splitext(filename)
+            if ext.lower() in supported_extensions:
+                entity_id = name_part
+                if entity_id in entity_image_paths:
+                    # 这可能意味着同一个实体有多个格式的图像，或文件名冲突
+                    print(f"Warning: Duplicate image entity ID '{entity_id}' found ('{filename}' vs '{os.path.basename(entity_image_paths[entity_id])}'). Using first one found.")
+                else:
+                    entity_image_paths[entity_id] = os.path.join(img_dir, filename)
+
+    return entity_image_paths
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='下载并处理数据集')
     parser.add_argument('--dataset', type=str, default='flickr8k', choices=['flickr8k', 'cifar10', 'fashion_mnist'],

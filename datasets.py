@@ -7,7 +7,11 @@ import numpy as np
 from torchvision import transforms
 import json
 from typing import List, Dict, Tuple, Optional, Union, Any
+from PIL import Image  # Ensure PIL.Image is imported
 from transformers import CLIPTokenizer
+
+from config import KGAlignmentDatasetConfig
+from data_utils import load_alignment_pairs, load_entity_text_attributes, load_entity_image_paths
 
 # 在文件顶部添加缓存字典
 _DESCRIPTIONS_CACHE = {}
@@ -267,4 +271,179 @@ class Flickr8kDataset(Dataset):
             truncation=True, 
             max_length=max_length, 
             return_tensors='pt'
-        ) 
+        )
+
+class KGAlignmentDataset(Dataset):
+    """
+    知识图谱对齐数据集 (Knowledge Graph Alignment Dataset)
+
+    加载实体对、它们的文本属性和图像。
+    """
+    def __init__(self,
+                 config: KGAlignmentDatasetConfig,
+                 split: str,
+                 tokenizer, # 外部传入的tokenizer, e.g., from transformers
+                 transform, # 外部传入的图像变换
+                 text_tokenizer_max_len: int = 32):
+        """
+        初始化KGAlignmentDataset
+
+        Args:
+            config: KGAlignmentDatasetConfig 实例
+            split: 数据集分割 ('train', 'val', 'test')
+            tokenizer: 用于文本编码的tokenizer
+            transform: 用于图像预处理的 torchvision transform
+            text_tokenizer_max_len: tokenizer处理文本时的最大长度
+        """
+        self.config = config
+        self.split = split.lower()
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.text_tokenizer_max_len = text_tokenizer_max_len
+
+        # 1. 加载对齐实体对
+        self.aligned_pairs: List[Tuple[str, str]] = []
+        alignment_file = None
+        if self.split == 'train':
+            alignment_file = self.config.alignment_train_file
+        elif self.split == 'val':
+            alignment_file = self.config.alignment_val_file
+        elif self.split == 'test':
+            alignment_file = self.config.alignment_test_file
+
+        if alignment_file:
+            if not os.path.exists(alignment_file):
+                print(f"Warning: Alignment file for split '{self.split}' not found at {alignment_file}. Dataset will be empty.")
+            else:
+                try:
+                    self.aligned_pairs = load_alignment_pairs(alignment_file)
+                except FileNotFoundError:
+                    print(f"Error: Alignment file for split '{self.split}' not found at {alignment_file}. Dataset will be empty.")
+        else:
+            print(f"Warning: No alignment file specified for split '{self.split}' in config. Dataset will be empty.")
+
+        # 2. 加载实体文本属性
+        self.entity_texts: Dict[str, str] = {}
+        if self.config.entity_text_file:
+            if not os.path.exists(self.config.entity_text_file):
+                print(f"Warning: Entity text file not found at {self.config.entity_text_file}. Text attributes will be empty.")
+            else:
+                try:
+                    self.entity_texts = load_entity_text_attributes(self.config.entity_text_file)
+                except FileNotFoundError:
+                     print(f"Error: Entity text file not found at {self.config.entity_text_file}. Text attributes will be empty.")
+        else:
+            print("Info: No entity text file specified in config. Text attributes will be empty.")
+
+        # 3. 收集所有独特的实体ID，并加载图像路径
+        all_entity_ids_set = set()
+        for e1, e2 in self.aligned_pairs:
+            all_entity_ids_set.add(e1)
+            all_entity_ids_set.add(e2)
+        all_entity_ids_list = list(all_entity_ids_set)
+
+        self.entity_image_paths: Dict[str, str] = {}
+        if self.config.entity_img_dir:
+            if not os.path.isdir(self.config.entity_img_dir):
+                print(f"Warning: Entity image directory not found at {self.config.entity_img_dir}. Image paths will be empty.")
+            else:
+                try:
+                    self.entity_image_paths = load_entity_image_paths(self.config.entity_img_dir, all_entity_ids_list)
+                except FileNotFoundError:
+                    print(f"Error: Entity image directory not found at {self.config.entity_img_dir}. Image paths will be empty.")
+        else:
+            print("Info: No entity image directory specified in config. Image paths will be empty.")
+
+        # 4. 初始化默认图像张量 (使用config中的in_channels和image_size)
+        # DatasetConfig (父类) 应该有 in_channels 和 image_size
+        if not hasattr(self.config, 'in_channels') or not hasattr(self.config, 'image_size'):
+            raise ValueError("KGAlignmentDatasetConfig must have 'in_channels' and 'image_size' attributes (possibly inherited).")
+
+        # image_size is expected to be a tuple (height, width)
+        if not isinstance(self.config.image_size, tuple) or len(self.config.image_size) != 2:
+             raise ValueError(f"config.image_size must be a tuple of (height, width), got {self.config.image_size}")
+
+        self.default_image_tensor = torch.zeros(
+            self.config.in_channels,
+            self.config.image_size[0],
+            self.config.image_size[1]
+        )
+
+        print(f"KGAlignmentDataset for split '{self.split}' initialized: {len(self.aligned_pairs)} pairs.")
+        if not self.aligned_pairs:
+             print(f"Warning: KGAlignmentDataset for split '{self.split}' is empty. Check file paths and content.")
+
+
+    def __len__(self) -> int:
+        """返回对齐实体对的数量"""
+        return len(self.aligned_pairs)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                             torch.Tensor, torch.Tensor, torch.Tensor,
+                                             torch.Tensor]:
+        """
+        获取指定索引的样本对。
+
+        返回:
+            (img_tensor1, input_ids1, attention_mask1,
+             img_tensor2, input_ids2, attention_mask2,
+             label)
+        """
+        if idx >= len(self.aligned_pairs):
+            raise IndexError("Index out of bounds")
+
+        entity1_id, entity2_id = self.aligned_pairs[idx]
+
+        # 处理实体1
+        text1 = self.entity_texts.get(entity1_id, "")
+        tokenized_text1 = self.tokenizer(
+            text1,
+            padding='max_length',
+            truncation=True,
+            max_length=self.text_tokenizer_max_len,
+            return_tensors='pt'
+        )
+        input_ids1 = tokenized_text1['input_ids'].squeeze(0) # Remove batch dim
+        attention_mask1 = tokenized_text1['attention_mask'].squeeze(0) # Remove batch dim
+
+        img_path1 = self.entity_image_paths.get(entity1_id)
+        if img_path1 and os.path.exists(img_path1):
+            try:
+                image1 = Image.open(img_path1).convert('RGB')
+                img_tensor1 = self.transform(image1) if self.transform else self.default_image_tensor
+            except Exception as e:
+                print(f"Warning: Error loading image {img_path1} for entity {entity1_id}: {e}. Using default tensor.")
+                img_tensor1 = self.default_image_tensor
+        else:
+            img_tensor1 = self.default_image_tensor
+
+        # 处理实体2
+        text2 = self.entity_texts.get(entity2_id, "")
+        tokenized_text2 = self.tokenizer(
+            text2,
+            padding='max_length',
+            truncation=True,
+            max_length=self.text_tokenizer_max_len,
+            return_tensors='pt'
+        )
+        input_ids2 = tokenized_text2['input_ids'].squeeze(0) # Remove batch dim
+        attention_mask2 = tokenized_text2['attention_mask'].squeeze(0) # Remove batch dim
+
+        img_path2 = self.entity_image_paths.get(entity2_id)
+        if img_path2 and os.path.exists(img_path2):
+            try:
+                image2 = Image.open(img_path2).convert('RGB')
+                img_tensor2 = self.transform(image2) if self.transform else self.default_image_tensor
+            except Exception as e:
+                print(f"Warning: Error loading image {img_path2} for entity {entity2_id}: {e}. Using default tensor.")
+                img_tensor2 = self.default_image_tensor
+        else:
+            img_tensor2 = self.default_image_tensor
+
+        # 标签 (默认为正样本对)
+        # TODO: Implement negative sampling strategy if needed, e.g., by modifying label or pair
+        label = torch.tensor(1, dtype=torch.long)
+
+        return (img_tensor1, input_ids1, attention_mask1,
+                img_tensor2, input_ids2, attention_mask2,
+                label)

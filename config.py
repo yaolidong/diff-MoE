@@ -120,6 +120,22 @@ class Flickr8kConfig(DatasetConfig):
         self.text_available = True  # 标记数据集包含文本描述
 
 @dataclass
+class KGAlignmentDatasetConfig(DatasetConfig):
+    """知识图谱对齐数据集配置"""
+    alignment_train_file: str = None
+    alignment_val_file: str = None
+    alignment_test_file: str = None
+    entity_text_file: str = None
+    entity_img_dir: str = None
+    kg_names: List[str] = field(default_factory=lambda: ['KG1', 'KG2'])
+    alignment_margin: float = 1.0
+    embedding_dim: int = 512
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.name = "KGAlignment"
+
+@dataclass
 class TrainingConfig:
     """训练配置"""
     # 基本训练参数
