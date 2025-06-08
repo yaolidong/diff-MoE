@@ -646,7 +646,7 @@ class MultiModalMoE(nn.Module):
         img_size: int,
         patch_size: int,
         in_channels: int,
-        num_classes: int,
+        # num_classes: int, # Removed num_classes
         embed_dim: int = 512,
         num_general_experts: int = 8,
         top_k: int = 2,
@@ -671,7 +671,7 @@ class MultiModalMoE(nn.Module):
             'img_size': img_size,
             'patch_size': patch_size,
             'in_channels': in_channels,
-            'num_classes': num_classes,
+            # 'num_classes': num_classes, # Removed num_classes
             'embed_dim': embed_dim,
             'num_general_experts': num_general_experts,
             'top_k': top_k,
@@ -750,7 +750,7 @@ class MultiModalMoE(nn.Module):
         )
         
         # 分类头
-        self.classifier = nn.Linear(embed_dim, num_classes)
+        # self.classifier = nn.Linear(embed_dim, num_classes) # Removed classifier
         
         # 初始化
         self.apply(self._init_weights)
@@ -798,184 +798,197 @@ class MultiModalMoE(nn.Module):
         )
         pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, new_size * new_size, dim)
         return pos_embed
-        
-    def forward(self, 
-                images: torch.Tensor, 
-                text_tokens: Optional[torch.Tensor] = None, 
-                attention_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """前向传播
-        Args:
-            images: [batch_size, in_channels, height, width]
-            text_tokens: [batch_size, seq_len]
-            attention_mask: [batch_size, seq_len]
+
+    def _process_single_entity_input(self,
+                                     images: torch.Tensor,
+                                     text_tokens: Optional[torch.Tensor],
+                                     attention_mask: Optional[torch.Tensor]) -> Dict[str, Any]:
+        """
+        Processes a single entity's image and optional text to produce embeddings and losses.
         """
         batch_size = images.shape[0]
         device = images.device
-        
-        # 1. 处理图像输入
-        # 图像Patch嵌入
+
+        # 1. Process image input
         img_tokens = self.patch_embed(images)
-            
-            # 应用位置编码
         if img_tokens.size(1) != self.img_pos_embed.size(1):
             pos_embed = self.interpolate_pos_encoding(img_tokens, self.img_pos_embed)
         else:
             pos_embed = self.img_pos_embed
-            
-            # 确保位置编码在正确的设备上
-            pos_embed = pos_embed.to(device)
-            
-            # 加上位置编码
+        pos_embed = pos_embed.to(device)
         img_tokens = img_tokens + pos_embed
-            
-            # 添加类型编码（图像token为0）
         img_type_ids = torch.zeros(batch_size, img_tokens.size(1), dtype=torch.long, device=device)
         img_tokens = img_tokens + self.token_type_embed(img_type_ids)
-            
-            # 应用dropout
         img_tokens = self.dropout(img_tokens)
-            
-        # 2. 处理文本输入
+
+        # 2. Process text input
         text_tokens_processed = None
-        text_features = None
+        text_features_after_encoder = None # Variable to hold text features after text_encoder
+        text_encoder_outputs = {} # Initialize, will hold outputs from text_encoder
+
         if text_tokens is not None:
-            # 确保文本输入在正确的设备上
             text_tokens = text_tokens.to(device)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
-                
-            # 文本嵌入
-            text_features = self.text_embedding(text_tokens)
-            text_features = self.text_projection(text_features)
-                
-            # 添加文本位置编码
-            text_pos_embed = self.text_pos_embed[:, :text_features.size(1), :].to(device)
-            text_features = text_features + text_pos_embed
-                
-            # 添加类型编码（文本token为1）
-            text_type_ids = torch.ones(batch_size, text_features.size(1), dtype=torch.long, device=device)
-            text_features = text_features + self.token_type_embed(text_type_ids)
-                
-            # 应用dropout
-            text_tokens_processed = self.dropout(text_features)
-        
-        # 3. 通过编码器处理图像和文本
+
+            raw_text_embeds = self.text_embedding(text_tokens)
+            projected_text_embeds = self.text_projection(raw_text_embeds)
+
+            text_pos_embed = self.text_pos_embed[:, :projected_text_embeds.size(1), :].to(device)
+            processed_text_embeds = projected_text_embeds + text_pos_embed
+
+            text_type_ids = torch.ones(batch_size, processed_text_embeds.size(1), dtype=torch.long, device=device)
+            processed_text_embeds = processed_text_embeds + self.token_type_embed(text_type_ids)
+            text_tokens_processed = self.dropout(processed_text_embeds) # These are inputs to text_encoder
+
+        # 3. Encode image and text
         img_encoder_outputs = self.image_encoder(img_tokens)
         img_features = img_encoder_outputs['output']
         
-        # 如果有文本输入，处理文本并进行跨模态融合
-        fusion_outputs = {}
         if text_tokens_processed is not None:
             text_encoder_outputs = self.text_encoder(text_tokens_processed)
-            text_features = text_encoder_outputs['output']
-            
-            # 跨模态融合
-            fusion_outputs = self.cross_modal_fusion(img_features, text_features)
+            text_features_after_encoder = text_encoder_outputs['output']
+
+        # 4. Cross-modal fusion
+        fusion_outputs = {} # Initialize
+        if text_tokens_processed is not None and text_features_after_encoder is not None:
+            fusion_outputs = self.cross_modal_fusion(img_features, text_features_after_encoder)
             final_features = fusion_outputs['output']
         else:
-            # 如果没有文本输入，只使用图像特征
             final_features = img_features
             fusion_outputs = {'output': final_features}
-        
-        # 4. 全局池化 - 平均池化
-        pooled_features = final_features.mean(dim=1)
-        
-        # 5. 分类
-        logits = self.classifier(pooled_features)
-        
-        # 收集所有层的路由决策，用于计算路由损失
-        all_router_logits = []
-        all_router_probs = []
-        
-        # 收集图像编码器路由决策
+
+        # 5. Global pooling
+        pooled_features_entity = final_features.mean(dim=1)
+
+        # 6. Collect router logits and probs for loss calculation
+        all_router_logits_entity = []
+        all_router_probs_entity = []
+
         for i in range(self.config['img_encoder_layers']):
-            layer_outputs = img_encoder_outputs['layer_outputs'][f'layer_{i}']
+            layer_outputs = img_encoder_outputs.get('layer_outputs', {}).get(f'layer_{i}', {})
             if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
-                all_router_logits.append(layer_outputs['router_logits'])
+                all_router_logits_entity.append(layer_outputs['router_logits'])
             if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
-                all_router_probs.append(layer_outputs['router_probs'])
+                all_router_probs_entity.append(layer_outputs['router_probs'])
         
-        # 如果有文本输入，收集文本编码器和融合层路由决策
         if text_tokens_processed is not None:
-            # 文本编码器路由决策
             for i in range(self.config['text_encoder_layers']):
-                layer_outputs = text_encoder_outputs['layer_outputs'][f'layer_{i}']
+                layer_outputs = text_encoder_outputs.get('layer_outputs', {}).get(f'layer_{i}', {})
                 if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
-                    all_router_logits.append(layer_outputs['router_logits'])
+                    all_router_logits_entity.append(layer_outputs['router_logits'])
                 if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
-                    all_router_probs.append(layer_outputs['router_probs'])
+                    all_router_probs_entity.append(layer_outputs['router_probs'])
             
-            # 融合层路由决策
-            for i in range(self.config['fusion_layers']):
-                layer_outputs = fusion_outputs['layer_outputs'][f'fusion_layer_{i}']
-                if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
-                    all_router_logits.append(layer_outputs['router_logits'])
-                if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
-                    all_router_probs.append(layer_outputs['router_probs'])
-        
-        # 计算路由损失
-        router_z_loss = torch.tensor(0.0, device=device)
-        router_balance_loss = torch.tensor(0.0, device=device)
-        
-        for router_logits in all_router_logits:
-            router_z_loss = router_z_loss + self.compute_z_loss(router_logits)
-            
-        for router_probs in all_router_probs:
-            router_balance_loss = router_balance_loss + self.compute_load_loss(router_probs)
-        
-        # 计算跨模态对齐损失
-        cross_modal_loss = torch.tensor(0.0, device=device)
-        contrastive_loss = torch.tensor(0.0, device=device)
-        if text_tokens_processed is not None:
-            # 简单的余弦相似度损失
+            if 'layer_outputs' in fusion_outputs: # fusion_outputs might not have layer_outputs if only image
+                for i in range(self.config['fusion_layers']):
+                    layer_outputs = fusion_outputs.get('layer_outputs', {}).get(f'fusion_layer_{i}', {})
+                    if 'router_logits' in layer_outputs and layer_outputs['router_logits'] is not None:
+                        all_router_logits_entity.append(layer_outputs['router_logits'])
+                    if 'router_probs' in layer_outputs and layer_outputs['router_probs'] is not None:
+                        all_router_probs_entity.append(layer_outputs['router_probs'])
+
+        # 7. Calculate individual (unweighted) losses for this entity
+        router_z_loss_entity = torch.tensor(0.0, device=device)
+        for logits_item in all_router_logits_entity:
+            router_z_loss_entity += self.compute_z_loss(logits_item)
+
+        router_balance_loss_entity = torch.tensor(0.0, device=device)
+        for probs_item in all_router_probs_entity:
+            router_balance_loss_entity += self.compute_load_loss(probs_item)
+
+        cross_modal_loss_entity = torch.tensor(0.0, device=device)
+        contrastive_loss_entity = torch.tensor(0.0, device=device)
+        if text_tokens_processed is not None and text_features_after_encoder is not None:
             img_mean = img_features.mean(dim=1)
-            text_mean = text_features.mean(dim=1)
-            
+            text_mean = text_features_after_encoder.mean(dim=1)
             img_norm = F.normalize(img_mean, p=2, dim=1)
             text_norm = F.normalize(text_mean, p=2, dim=1)
             
-            # 最大化余弦相似度（最小化负相似度）
-            cross_modal_loss = -torch.sum(img_norm * text_norm) / batch_size
+            # Ensure cross_modal_loss is per-sample then averaged, or sum and divide by batch_size later.
+            # Current: -torch.sum(img_norm * text_norm) / batch_size
+            # Let's make it sum and then average at the end or ensure it's a scalar.
+            # For now, keeping it as is, assuming it's scalar. If it's per-element, .mean() is needed.
+            # The original code had / batch_size, implying it was a sum. Let's make it sum here.
+            cross_modal_loss_entity = -torch.sum(img_norm * text_norm)
             
-            # 计算对比损失
-            # 计算所有样本对之间的相似度矩阵
             similarity_matrix = torch.matmul(img_norm, text_norm.transpose(0, 1))
-            
-            # 正样本对（对角线）和负样本对
             labels = torch.arange(batch_size, device=device)
-            
-            # 计算对比损失（InfoNCE损失）
             contrastive_loss_i2t = F.cross_entropy(similarity_matrix / 0.07, labels)
             contrastive_loss_t2i = F.cross_entropy(similarity_matrix.t() / 0.07, labels)
-            contrastive_loss = (contrastive_loss_i2t + contrastive_loss_t2i) / 2.0
-        
-        # 总路由损失
-        router_loss = (
-            self.router_z_loss_weight * router_z_loss + 
-            self.router_balance_loss_weight * router_balance_loss +
-            self.cross_modal_alignment_weight * cross_modal_loss +
-            self.contrastive_loss_weight * contrastive_loss
-        )
-        
-        return {
-            'logits': logits,
-            'embeddings': pooled_features,
-            'img_features': img_features,
-            'text_features': text_features if text_tokens_processed is not None else None,
-            'fused_features': final_features,
-            'router_z_loss': router_z_loss,
-            'router_balance_loss': router_balance_loss,
-            'cross_modal_loss': cross_modal_loss,
-            'contrastive_loss': contrastive_loss,
-            'router_loss': router_loss,
-            # 存储专家激活情况，用于可视化
-            'expert_activations': {
-                'img_encoder': img_encoder_outputs.get('layer_outputs', {}),
-                'text_encoder': text_encoder_outputs.get('layer_outputs', {}) if text_tokens_processed is not None else {},
-                'fusion': fusion_outputs.get('layer_outputs', {}) if text_tokens_processed is not None else {}
-            }
+            contrastive_loss_entity = (contrastive_loss_i2t + contrastive_loss_t2i) / 2.0
+
+        expert_activations_entity = {
+            'img_encoder': img_encoder_outputs.get('layer_outputs', {}),
+            'text_encoder': text_encoder_outputs.get('layer_outputs', {}) if text_tokens_processed is not None else {},
+            'fusion': fusion_outputs.get('layer_outputs', {}) if text_tokens_processed is not None else {}
         }
-    
+
+        return {
+            'pooled_features_entity': pooled_features_entity,
+            'img_features_entity': img_features,
+            'text_features_entity': text_features_after_encoder,
+            'fused_features_entity': final_features,
+            'router_z_loss_entity': router_z_loss_entity,
+            'router_balance_loss_entity': router_balance_loss_entity,
+            'cross_modal_loss_entity': cross_modal_loss_entity, # This is a sum over batch
+            'contrastive_loss_entity': contrastive_loss_entity, # This is a scalar
+            'expert_activations_entity': expert_activations_entity
+        }
+
+    def forward(self,
+                images1: torch.Tensor,
+                text_tokens1: Optional[torch.Tensor],
+                attention_mask1: Optional[torch.Tensor],
+                images2: torch.Tensor,
+                text_tokens2: Optional[torch.Tensor],
+                attention_mask2: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for processing two entity inputs.
+        """
+        outputs1 = self._process_single_entity_input(images1, text_tokens1, attention_mask1)
+        outputs2 = self._process_single_entity_input(images2, text_tokens2, attention_mask2)
+
+        # Summing scalar losses. For cross_modal_loss, average by batch size if it's a sum.
+        # Assuming batch size is consistent for both inputs.
+        batch_size = images1.shape[0]
+
+        total_router_z_loss = outputs1['router_z_loss_entity'] + outputs2['router_z_loss_entity']
+        total_router_balance_loss = outputs1['router_balance_loss_entity'] + outputs2['router_balance_loss_entity']
+        
+        # cross_modal_loss_entity was sum, so sum them and then divide by total elements (2*batch_size)
+        # or divide each by batch_size if that was the original intent of the per-entity loss
+        # Original single entity loss was: -torch.sum(img_norm * text_norm) / batch_size
+        # So, we sum two such terms.
+        total_cross_modal_loss = (outputs1['cross_modal_loss_entity'] + outputs2['cross_modal_loss_entity']) / batch_size
+
+        total_contrastive_loss = outputs1['contrastive_loss_entity'] + outputs2['contrastive_loss_entity'] # These are already scalars
+
+        combined_router_loss = (
+            self.router_z_loss_weight * total_router_z_loss +
+            self.router_balance_loss_weight * total_router_balance_loss +
+            self.cross_modal_alignment_weight * total_cross_modal_loss + # total_cross_modal_loss is now averaged
+            self.contrastive_loss_weight * total_contrastive_loss
+        )
+
+        return {
+            'embedding1': outputs1['pooled_features_entity'],
+            'embedding2': outputs2['pooled_features_entity'],
+            'img_features1': outputs1['img_features_entity'],
+            'text_features1': outputs1['text_features_entity'],
+            'fused_features1': outputs1['fused_features_entity'],
+            'img_features2': outputs2['img_features_entity'],
+            'text_features2': outputs2['text_features_entity'],
+            'fused_features2': outputs2['fused_features_entity'],
+            'router_z_loss': total_router_z_loss,
+            'router_balance_loss': total_router_balance_loss,
+            'cross_modal_loss': total_cross_modal_loss,
+            'contrastive_loss': total_contrastive_loss,
+            'router_loss': combined_router_loss,
+            'expert_activations1': outputs1['expert_activations_entity'],
+            'expert_activations2': outputs2['expert_activations_entity'],
+        }
+
     def compute_z_loss(self, router_logits: torch.Tensor) -> torch.Tensor:
         """计算z损失来正则化路由逻辑"""
         # 计算每个专家的平均路由概率
