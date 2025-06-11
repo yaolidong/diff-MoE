@@ -6,14 +6,7 @@
 
 ```
 diff-MoE/
-├── main.py               # 主程序入口
-├── model.py              # 模型定义
-├── train.py              # 训练函数
-├── test.py               # 测试和评估函数
-├── utils.py              # 工具函数和可视化
-├── data_loader.py        # 数据加载器
-├── datasets.py           # 数据集定义和标签文本描述
-├── data_utils.py         # 数据集下载和预处理工具
+├── .gitignore            # Git忽略文件配置
 ├── config.py             # 配置参数
 ├── configs/              # 配置文件目录
 │   ├── model.yaml        # 模型配置
@@ -21,9 +14,21 @@ diff-MoE/
 │   ├── cifar10.yaml      # CIFAR10数据集配置
 │   ├── fashion_mnist.yaml # Fashion-MNIST数据集配置
 │   └── visualization.yaml # 可视化配置
-├── requirements.txt      # 依赖库
+├── data_loader.py        # 数据加载器
+├── data_utils.py         # 数据集下载和预处理工具
+├── datasets.py           # 数据集定义和标签文本描述
+├── diff-MoE.code-workspace # VS Code 工作区配置文件
+├── image_captioning.py   # 图像字幕生成脚本
+├── image_classification.py # 图像分类脚本
+├── main.py               # 主程序入口
+├── model.py              # 模型定义
+├── profile_analyzer.py   # 性能分析工具
 ├── README.md             # 项目说明
-└── README_FLICKR8K.md    # Flickr8k数据集使用说明
+├── requirements.txt      # 依赖库
+├── test.py               # 测试和评估函数
+├── train.py              # 训练函数
+├── training_example.py   # 训练示例脚本
+└── utils.py              # 工具函数和可视化
 ```
 
 ## 功能模块
@@ -104,11 +109,15 @@ python main.py --dataset cifar10 --mode train_test --batch_size 64 --epochs 10
 
 ## 模型架构
 
-Diff-MoE是一个基于Transformer架构的多模态混合专家模型，主要特点：
+Diff-MoE是一个基于Transformer架构的多模态混合专家模型。其核心组件是`UnifiedModalEncoder`，一个包含多种类型专家的混合专家 (MoE) 模块。这些模块被用于构建图像编码器、文本编码器以及跨模态融合层。主要特点包括：
 
-1. **混合专家层**: 包含共享和模态特定的专家网络，通过路由器分配不同的输入到不同的专家
-2. **多模态融合**: 结合图像和文本特征进行预测
-3. **Attention机制**: 使用自注意力和交叉注意力进行特征交互
+1. **混合专家 (MoE) 模块 (`UnifiedModalEncoder`)**: 每个模块内包含多种专家：
+    - 一个全局共享专家 (`global_expert`)，处理所有输入token。
+    - 模态特定专家 (`vision_expert`, `text_expert`)，分别处理图像和文本token（在非融合层中）。
+    - 一个通用专家池 (`general_experts`)，由`AttentiveRouter`为每个token选择一部分专家进行处理。
+2. **多模态融合**: 通过`CrossModalFusion`层结合图像和文本特征，该层也利用了`UnifiedModalEncoder`模块。
+3. **Attention机制**: 在`UnifiedModalEncoder`中使用自注意力和交叉注意力（在`CrossModalFusion`中）进行特征交互。
+4. **分层编码**: `ImageEncoder`和`TextEncoder`分别由多个`UnifiedModalEncoder`堆叠而成，用于深度特征提取。
 
 ### 模型架构详细说明
 
@@ -138,19 +147,18 @@ Diff-MoE是一个基于Transformer架构的多模态混合专家模型，主要�
 |  |  +------+------+    +-------+-------+  |
 |  |         |                   |          |
 |  |         v                   v          |
-|  |  +------------------+----------------+ |
-|  |  |          混合专家层 (MoE)          | |
-|  |  +----------------------------------+ |
-|  |  |                                  | |
-|  |  | +------------+ +---------------+ | |
-|  |  | | 共享专家   | | 模态特定专家  | | |
-|  |  | +------------+ +---------------+ | |
-|  |  |                                  | |
-|  |  | +------------+                   | |
-|  |  | | 注意力路由器|                   | |
-|  |  | +------------+                   | |
-|  |  +----------------------------------+ |
-|  |                  |                    |
+|  |  +------------------------------------------+ |
+|  |  |       混合专家模块 (UnifiedModalEncoder)     | |
+|  |  |  (包含全局专家, 模态特定专家, 通用专家池)  | |
+|  |  +------------------------------------------+ |
+|  |  | +------------------+  +-----------------+ | |
+|  |  | | 全局/模态特定专家 |  |  通用专家池      | | |
+|  |  | +------------------+  +-----------------+ | |
+|  |  |                       | +-------------+ | | |
+|  |  |                       | | 注意力路由器 | | | |
+|  |  |                       | +-------------+ | | |
+|  |  +------------------------------------------+ |
+|  |                         |                      |
 |  +------------------+--------------------+
 |                     |                     
 |                     v                     
@@ -165,69 +173,136 @@ Diff-MoE是一个基于Transformer架构的多模态混合专家模型，主要�
 
 #### 关键组件
 
-1. **专家模块 (Expert)**: 
-   - 每个专家由两个全连接层组成，带有激活函数和Layer Normalization
-   - 支持的激活函数: GELU, ReLU, SiLU
-   - 包含Dropout机制以防止过拟合
+1.  **`Expert` (专家模块)**:
+    *   基础的前馈网络单元，由两个全连接层、激活函数 (如GELU, ReLU, SiLU)、Layer Normalization和Dropout组成。
+    *   用于构建`UnifiedModalEncoder`中的各种专家。
 
-2. **注意力路由器 (AttentiveRouter)**:
-   - 基于注意力机制的路由算法
-   - 为每个输入token分配top-k个专家
-   - 使用正交初始化提高稳定性
-   - 支持噪声辅助路由以增强训练过程中的探索
+2.  **`PatchEmbed` (图像分块嵌入层)**:
+    *   将输入图像分割成固定大小的块 (patches)，并通过卷积层将每个块线性嵌入为向量。
+    *   为图像数据进入Transformer结构做准备。
 
-3. **统一模态编码器 (UnifiedModalEncoder)**:
-   - 多头自注意力机制
-   - 跨模态交叉注意力融合
-   - 混合专家前馈网络
-   - 支持梯度检查点以节省显存
+3.  **`AttentiveRouter` (注意力路由器)**:
+    *   在`UnifiedModalEncoder`内部使用，基于注意力机制为每个输入token从`general_experts`（通用专家池）中选择top-k个专家。
+    *   包含正交初始化和可选的噪声辅助路由。
 
-4. **图像处理**:
-   - Patch嵌入层将图像分割为固定大小的块
-   - 位置编码提供空间信息
+4.  **`UnifiedModalEncoder` (统一模态编码器/混合专家模块)**:
+    *   模型的核心MoE构建块，包含：
+        *   **自注意力层**: 捕捉输入序列内不同token间的关系。
+        *   **多种专家类型**:
+            *   `global_expert`: 一个全局共享专家，处理所有token。
+            *   `vision_expert` 和 `text_expert`: 模态特定专家，分别处理图像和文本token（在专门的图像/文本编码层中，非融合层）。
+            *   `general_experts`: 一个通用专家池，由`AttentiveRouter`动态选择。
+        *   **残差连接和Layer Normalization**: 保证训练稳定性。
+    *   支持梯度检查点以节省显存。
+    *   *注意: ASCII图中的“共享专家”指`global_expert`，“模态特定专家”指`vision_expert`/`text_expert`。通用专家池由路由器管理。*
 
-5. **文本处理**:
-   - 使用嵌入层将文本token转化为向量
-   - 支持自注意力处理序列信息
-   - 使用CLIP tokenizer进行文本分词，最大序列长度为77
+5.  **`ImageEncoder` (图像编码器)**:
+    *   由多个`UnifiedModalEncoder`模块堆叠而成，专门用于处理图像patch嵌入序列，提取深层图像特征。
+
+6.  **`TextEncoder` (文本编码器)**:
+    *   与`ImageEncoder`类似，由多个`UnifiedModalEncoder`模块堆叠而成，处理文本token嵌入序列，提取深层文本特征。
+
+7.  **`CrossModalFusion` (跨模态融合层)**:
+    *   负责融合来自`ImageEncoder`和`TextEncoder`的特征。
+    *   通常包含交叉注意力机制，允许图像和文本特征相互作用。
+    *   也可能使用`UnifiedModalEncoder`模块进行深度融合处理。
+
+8.  **`MultiModalMoE` (多模态混合专家主模型)**:
+    *   顶层模型，整合了上述所有组件（`PatchEmbed`, `ImageEncoder`, `TextEncoder`, `CrossModalFusion`）。
+    *   处理图像和（可选的）文本输入，最终输出融合后的特征表示。
+    *   管理位置编码、模态类型嵌入等。
+
+*之前的“图像处理”和“文本处理”小节内容已整合到上述组件描述中。*
 
 ### 模型配置参数
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| img_size | 28 | 输入图像大小 |
-| patch_size | 4 | 图像patch大小 |
-| in_channels | 1 | 输入图像通道数 |
-| embed_dim | 512 | 嵌入维度 |
-| num_shared_experts | 4 | 共享专家数量 |
-| num_modality_specific_experts | 2 | 模态特定专家数量 |
-| top_k | 2 | 每个输入选择的专家数量 |
-| num_heads | 8 | 注意力头数量 |
-| num_layers | 6 | Transformer层数 |
-| num_classes | 10 | 分类类别数量 |
-| dropout | 0.1 | Dropout比率 |
-| activation | 'gelu' | 激活函数类型 |
+下表列出了模型的主要配置参数及其默认值。这些值通常在 `configs/model.yaml` 中定义或在模型初始化时设置。
+
+| 参数                             | 默认值    | 描述                                                                 |
+| -------------------------------- | --------- | -------------------------------------------------------------------- |
+| `img_size`                       | 28        | 输入图像大小                                                           |
+| `patch_size`                     | 4         | 图像patch大小                                                          |
+| `in_channels`                    | 1         | 输入图像通道数                                                         |
+| `embed_dim`                      | 512       | 嵌入维度                                                               |
+| `num_general_experts`            | 4         | 通用专家池中的专家数量 (`UnifiedModalEncoder`中的`general_experts`)      |
+| `num_modality_specific_experts`  | 2         | 模态特定专家数量 (`vision_expert` 和 `text_expert`，每个`UnifiedModalEncoder`中) |
+| `top_k`                          | 2         | 每个token为通用专家池选择的专家数量                                     |
+| `num_heads`                      | 8         | 注意力头数量                                                             |
+| `img_encoder_layers`             | 6         | 图像编码器中的`UnifiedModalEncoder`层数                               |
+| `text_encoder_layers`            | 4         | 文本编码器中的`UnifiedModalEncoder`层数                               |
+| `fusion_layers`                  | 3         | 跨模态融合层中的`UnifiedModalEncoder`层数                             |
+| `num_classes`                    | 10        | 输出类别数量 (通常由下游分类头定义)                                       |
+| `dropout`                        | 0.2       | Dropout比率                                                            |
+| `activation`                     | 'gelu'    | 激活函数类型 (如 'gelu', 'relu', 'silu')                               |
+| `layer_norm_eps`                 | 1e-5      | Layer Normalization中的epsilon值                                       |
+| `initializer_range`              | 0.02      | 权重初始化范围                                                           |
+| `use_gradient_checkpointing`     | `true`    | 是否使用梯度检查点以节省显存                                                 |
+| `vocab_size`                     | 50000     | 文本词汇表大小                                                           |
+| `max_text_len`                   | 32        | 最大文本序列长度                                                         |
+| `text_embed_dim`                 | 128       | 初始文本嵌入维度 (在投影到`embed_dim`之前)                               |
 
 ## 损失函数
 
-Diff-MoE模型的总损失函数由两部分组成：
+在训练Diff-MoE模型时，总的损失函数由两大部分构成：**模型内部辅助损失** (由`MultiModalMoE`模型自身计算和返回) 和 **任务特定损失** (在训练脚本中根据具体任务定义，例如分类任务的交叉熵损失)。
 
-1. **分类损失**：使用标准交叉熵损失(CrossEntropyLoss)计算预测与真实标签之间的差异
-   ```
-   分类损失 = CrossEntropyLoss(logits, labels)
-   ```
+### 1. 模型内部辅助损失 (Model-Internal Auxiliary Losses)
 
-2. **路由损失**：基于KL散度计算的专家负载均衡损失，确保专家被均匀使用
-   ```
-   负载目标分布 = 均匀分布(1/num_experts)
-   专家利用率 = 每个专家处理的token数 / 总容量
-   路由损失 = KL散度(专家利用率, 负载目标分布)
-   ```
+这些损失由`MultiModalMoE`模型在其`forward`方法中计算，旨在帮助模型学习更鲁棒和均衡的表示，并优化混合专家 (MoE) 的路由机制。模型返回的字典中包含一个键为 `'router_loss'` 的项，这是以下所有加权辅助损失的总和。
 
-3. **总损失**：
-   ```
-   总损失 = 分类损失 + 路由损失
-   ```
+各辅助损失组件说明如下：
+
+*   **路由器 Z-Loss (Router Z-Loss / 正则化损失)**:
+    *   **目的**: 对路由器的门控 logits 进行正则化，鼓励其输出的概率分布不过于集中。
+    *   **计算**: 由模型内部的 `compute_z_loss` 方法计算。其计算方式为：对每个路由器的输出`logits`应用`softmax`得到概率，计算每个专家在批次和序列维度上的平均激活概率，然后取这些平均概率的平方的均值，并乘以专家总数。
+    *   **权重**: `router_z_loss_weight` (默认为 `0.001`)。
+
+*   **路由器负载均衡损失 (Router Load Balancing Loss)**:
+    *   **目的**: 鼓励模型将输入 token 均匀地分配给通用专家池 (`general_experts`) 中的各个专家，避免部分专家过载而其他专家空闲。
+    *   **计算**: 基于KL散度，比较实际的专家token分配比例与理想的均匀分配比例。由模型内部的 `compute_load_loss` 方法计算。
+        ```
+        负载目标分布 = 均匀分布(1 / num_general_experts)
+        专家利用率 = 每个通用专家处理的token数 / 总token数
+        负载均衡损失 = KL散度(专家利用率, 负载目标分布)
+        ```
+    *   **权重**: `router_balance_loss_weight` (默认为 `0.01`)。
+
+*   **跨模态对齐损失 (Cross-Modal Alignment Loss)**:
+    *   **目的**: (当存在文本输入时) 促使模型学习图像和对应文本的相似或对齐的表示。这是通过最大化图像和文本特征的平均池化表示之间的余弦相似度来实现的。
+    *   **计算**: `-torch.sum(F.normalize(img_features_mean) * F.normalize(text_features_mean))`，然后进行批次平均。
+    *   **权重**: `cross_modal_alignment_weight` (默认为 `0.1`)。
+
+*   **对比损失 (Contrastive Loss)**:
+    *   **目的**: (当存在文本输入时) 学习一个共享的嵌入空间，其中匹配的图像-文本对的嵌入被拉近，而不匹配的对被推远。
+    *   **计算**: 通常使用InfoNCE损失变体，基于图像到文本和文本到图像的相似度矩阵计算交叉熵损失。
+    *   **权重**: `contrastive_loss_weight` (默认为 `0.1`)。
+
+**模型内部组合损失计算**:
+`MultiModalMoE`模型将上述加权损失汇总为一项（在返回字典中键为`'router_loss'`）：
+```
+Combined_Model_Internal_Loss = router_z_loss_weight * total_router_z_loss +
+                             router_balance_loss_weight * total_router_balance_loss +
+                             cross_modal_alignment_weight * total_cross_modal_loss +
+                             contrastive_loss_weight * total_contrastive_loss
+```
+*(注意：`total_router_z_loss`等是在模型内部对来自不同编码器层或处理流程的相应损失进行累加的结果。)*
+
+### 2. 任务特定损失 (Task-Specific Loss)
+
+该损失取决于模型的具体应用场景，在训练脚本中定义和计算。例如：
+
+*   **分类损失 (Classification Loss)**:
+    *   如果模型用于图像分类或多模态分类任务，通常会在`MultiModalMoE`模型输出的特征嵌入之上添加一个分类头 (如一个线性层)。
+    *   然后使用标准交叉熵损失 (CrossEntropyLoss) 计算预测 logits 与真实标签之间的差异。
+    ```
+    分类损失 = CrossEntropyLoss(classification_head_logits, labels)
+    ```
+
+### 3. 总训练损失 (Overall Training Loss)
+
+最终用于反向传播的总训练损失是模型内部辅助损失与任务特定损失的和：
+```
+总训练损失 = Combined_Model_Internal_Loss + Task_Specific_Loss
+```
 
 ### 优化器
 
